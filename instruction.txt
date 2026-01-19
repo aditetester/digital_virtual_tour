@@ -1,0 +1,8 @@
+instruction
+1.write on terminal npm install --force
+2.write on terminal npx expo start
+
+for kill backend server then restart
+1. write on terminal lsof -i :4000
+2. write on terminal kill -9 <PID>
+3. write on terminal npm run backend

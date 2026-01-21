@@ -621,7 +621,7 @@ function CommentsSection({ postId, colors, spacing, commentText, setCommentText 
         )}
       </ScrollView>
 
-      <View style={[styles.commentInputContainer, { borderTopColor: colors.border, backgroundColor: colors.background }]}>
+      <View style={[styles.commentInputContainer, { borderTopColor: colors.border, backgroundColor: colors.background, marginBottom: spacing.xl }]}>
         <TextInput
           style={[styles.commentInput, { backgroundColor: colors.card, color: colors.text }]}
           placeholder="Add a comment..."

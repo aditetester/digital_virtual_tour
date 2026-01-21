@@ -12,7 +12,7 @@ export class DownloadStorage {
     {
       id: "demo1",
       imageUrl: "https://images.unsplash.com/photo-1582719508461-905c673771fd?w=800",
-      downloadUrl: "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf",
+      downloadUrl: "https://images.unsplash.com/photo-1618773928121-c32242e63f39?w=800",
       title: "Demo PDF File",
       description: "A sample PDF file for testing downloads",
       createdAt: new Date().toISOString(),

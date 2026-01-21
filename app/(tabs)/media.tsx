@@ -1,8 +1,4 @@
 import { StyleSheet, View, Text, ScrollView, TouchableOpacity, TextInput, Image, ActivityIndicator, Linking, Modal } from 'react-native';
-
-
-
-
 import { useThemedStyles } from '@/lib/use-themed-styles';
 import { Search, Filter, Grid3x3, FileText, Film, Monitor, Camera, Mail, X } from 'lucide-react-native';
 import { useState, useMemo } from 'react';
@@ -12,12 +8,7 @@ import { useResponsive } from '@/lib/use-responsive';
 import { trpc } from '@/lib/trpc';
 import { WebView } from 'react-native-webview';
 
-
-
-
 const categories = ['All', 'Virtual Tours', 'Photos', 'Videos', 'Documents', 'Presentation', 'Screenshot', 'Email Banner'];
-
-
 
 export default function MediaScreen() {
   const { colors, spacing, borderRadius } = useThemedStyles();
@@ -49,7 +40,6 @@ export default function MediaScreen() {
   }, [selectedCategory, getAllQuery, getToursQuery, getPhotosQuery, getVideosQuery, getDocumentsQuery, getPresentationsQuery, getScreenshotsQuery, getBannersQuery]);
 
   const mediaItems = activeQuery.data || [];
-
 
   const filteredMedia = mediaItems.filter((item) => {
 
@@ -155,6 +145,23 @@ export default function MediaScreen() {
           );
         })}
       </ScrollView>
+
+      {selectedCategory !== 'All' && (
+        <View style={[styles.actionButtonsContainer, { paddingHorizontal: spacing.lg, marginBottom: spacing.md }]}>
+          <TouchableOpacity 
+            style={[styles.secondaryButton, { borderColor: colors.border }]}
+            onPress={() => console.log('New Folder pressed')}
+          >
+            <Text style={[styles.secondaryButtonText, { color: colors.text }]}>New Folder</Text>
+          </TouchableOpacity>
+          <TouchableOpacity 
+            style={[styles.primaryButton, { backgroundColor: colors.accent }]}
+            onPress={() => console.log(`Add ${selectedCategory} pressed`)}
+          >
+            <Text style={styles.primaryButtonText}>+ Add {selectedCategory}</Text>
+          </TouchableOpacity>
+        </View>
+      )}
 
       <ScrollView style={styles.content} contentContainerStyle={[styles.contentContainer, { padding: spacing.lg }]}>
         <View style={[
@@ -404,5 +411,35 @@ const styles = StyleSheet.create({
   },
   mediaSize: {
     fontSize: 12,
+  },
+  actionButtonsContainer: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  primaryButton: {
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 8,
+    justifyContent: 'center',
+    alignItems: 'center',
+    flex: 1,
+  },
+  primaryButtonText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  secondaryButton: {
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 8,
+    borderWidth: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    flex: 1,
+  },
+  secondaryButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
   },
 });

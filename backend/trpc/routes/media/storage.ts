@@ -47,8 +47,8 @@ export class MediaStorage {
     {
       id: '5',
       type: 'document',
-      title: 'Hotel Brochure 2025',
-      thumbnail: '',
+      title: 'Hotel Brochure 2026',
+      thumbnail: 'https://images.unsplash.com/photo-1551882547-ff40c63fe5fa?w=800',
       url: 'https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf',
       size: '2.5 MB',
       tags: ['Brochure', 'Sales'],
@@ -110,6 +110,15 @@ export class MediaStorage {
       thumbnail: 'https://images.unsplash.com/photo-1563986768609-322da13575f3?w=400',
       url: 'https://images.unsplash.com/photo-1563986768609-322da13575f3?w=800',
       tags: ['Newsletter', 'Marketing'],
+    },
+    {
+      id: '13',
+      type: 'presentation',
+      title: 'Grand Ballroom 360°',
+      thumbnail: "https://images.unsplash.com/photo-1582719508461-905c673771fd?w=800",
+      url: 'https://geckodigital.co/vt/PatinaMaldives',
+      size: '125 MB',
+      tags: ['Presentation', 'Ballroom'],
     },
   ];
 

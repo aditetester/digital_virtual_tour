@@ -25,10 +25,6 @@ import getPresentationsRoute from "./routes/media/get-presentations";
 import getScreenshotsRoute from "./routes/media/get-screenshots";
 import getBannersRoute from "./routes/media/get-banners";
 
-
-
-
-
 export const appRouter = createTRPCRouter({
   example: createTRPCRouter({
     hi: hiRoute,

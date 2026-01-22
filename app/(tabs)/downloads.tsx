@@ -9,6 +9,7 @@ import { trpc } from '@/lib/trpc';
 import RNFS from 'react-native-fs';
 import { unzip } from 'react-native-zip-archive';
 import { WebView } from 'react-native-webview';
+import StaticServer from '@dr.pogodin/react-native-static-server';
 
 type DownloadItem = {
   id: string;
@@ -41,6 +42,22 @@ export default function DownloadsScreen() {
     description: '',
   });
 
+  const [serverUrl, setServerUrl] = useState<string | null>(null);
+  const serverRef = React.useRef<any>(null);
+
+  const stopServer = useCallback(async () => {
+    if (serverRef.current) {
+      try {
+        await serverRef.current.stop();
+        console.log('Local server stopped');
+      } catch (err) {
+        console.error('Error stopping server:', err);
+      }
+      serverRef.current = null;
+    }
+    setServerUrl(null);
+  }, []);
+
   const downloadsQuery = trpc.downloads.getAll.useQuery();
 
   React.useEffect(() => {
@@ -57,23 +74,21 @@ export default function DownloadsScreen() {
     }
   }, [downloadsQuery.data]);
 
+  React.useEffect(() => {
+    return () => {
+      stopServer();
+    };
+  }, [stopServer]);
+
   const addUrlMutation = trpc.downloads.addUrl.useMutation({
-    onSuccess: (data) => {
-      setDownloads(prev => [...prev, {
-        ...data,
-        isDownloaded: false,
-      }]);
+    onSuccess: () => {
+      downloadsQuery.refetch();
+      Alert.alert('Added', 'New item has been added to the list.');
       setShowAddModal(false);
-      setNewDownload({
-        imageUrl: '',
-        downloadUrl: '',
-        title: '',
-        description: '',
-      });
-      Alert.alert('Success', 'Download URL added successfully!');
+      setNewDownload({ imageUrl: '', downloadUrl: '', title: '', description: '' });
     },
     onError: (error) => {
-      Alert.alert('Error', error.message || 'Failed to add download URL');
+      Alert.alert('Error', error.message || 'Failed to add item');
     },
   });
 
@@ -432,14 +447,44 @@ export default function DownloadsScreen() {
     );
   };
 
-  const handleOpenVirtualTour = useCallback((item: DownloadItem) => {
+  const handleOpenVirtualTour = useCallback(async (item: DownloadItem) => {
     if (item.indexHtmlPath) {
       console.log('Opening virtual tour:', item.indexHtmlPath);
+      
+      if (Platform.OS !== 'web' && item.unzippedPath) {
+        try {
+          await stopServer();
+          
+          const path = item.unzippedPath.replace('file://', '');
+          console.log('Starting static server for path:', path);
+          
+          const server = new StaticServer({ port: 0, fileDir: path, stopInBackground: false });
+          const url = await server.start();
+          serverRef.current = server;
+          
+          const fileName = item.indexHtmlPath.split('/').pop() || 'index.html';
+          const fullServerUrl = `${url}/${fileName}`;
+          
+          console.log('Static server started at:', fullServerUrl);
+          setServerUrl(fullServerUrl);
+        } catch (error) {
+          console.error('Failed to start static server:', error);
+          setServerUrl(null);
+        }
+      }
+      
       setShowVirtualTour(item.indexHtmlPath);
     } else {
       Alert.alert('Error', 'Virtual tour files not found. Please re-download.');
     }
-  }, []);
+  }, [stopServer]);
+
+  const handleCloseVirtualTour = useCallback(() => {
+    setShowVirtualTour(null);
+    if (Platform.OS !== 'web') {
+      stopServer();
+    }
+  }, [stopServer]);
 
   const handleOpenItem = useCallback((item: DownloadItem) => {
     console.log('Opening item:', item.title || item.id, 'Downloaded:', item.isDownloaded);
@@ -698,7 +743,7 @@ export default function DownloadsScreen() {
             <Text style={styles.tourTitle}>Virtual Tour</Text>
             <TouchableOpacity
               style={styles.closeButton}
-              onPress={() => setShowVirtualTour(null)}
+              onPress={handleCloseVirtualTour}
             >
               <X size={24} color={colors.text} />
             </TouchableOpacity>
@@ -713,8 +758,8 @@ export default function DownloadsScreen() {
             return (
               <WebView
                 source={{
-                  uri: fileUri,
-                  ...(Platform.OS === 'ios' && { allowingReadAccessToURL: parentDirectory }),
+                  uri: serverUrl || fileUri,
+                  ...(Platform.OS === 'ios' && !serverUrl && { allowingReadAccessToURL: parentDirectory }),
                 }}
                 style={{ flex: 1 }}
                 originWhitelist={['*']}

@@ -11,6 +11,8 @@
     "lint": "expo lint"
   },
   "dependencies": {
+    "@dr.pogodin/react-native-fs": "^2.36.2",
+    "@dr.pogodin/react-native-static-server": "^0.25.4",
     "@expo/vector-icons": "^15.0.3",
     "@hono/node-server": "^1.19.9",
     "@hono/trpc-server": "^0.4.0",
@@ -44,6 +46,7 @@
     "react": "19.1.0",
     "react-dom": "19.1.0",
     "react-native": "0.81.5",
+    "react-native-fs": "^2.20.0",
     "react-native-gesture-handler": "~2.28.0",
     "react-native-safe-area-context": "~5.6.0",
     "react-native-screens": "~4.16.0",
@@ -53,7 +56,6 @@
     "react-native-worklets": "0.5.1",
     "react-native-zip-archive": "^6.0.9",
     "superjson": "^2.2.6",
-    "react-native-fs": "^2.20.0",
     "zod": "^4.1.13",
     "zustand": "^5.0.2"
   },

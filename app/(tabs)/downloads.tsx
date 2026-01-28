@@ -1,7 +1,7 @@
 import React, { useState, useCallback } from 'react';
 import { StyleSheet, View, Text, ScrollView, TouchableOpacity, Alert, Image, TextInput, Modal, Linking, Platform, ActivityIndicator } from 'react-native';
 import { getThemeColors, GeckoTheme, ThemeColors } from '@/constants/theme';
-import { Download, Trash2, Plus, X, ExternalLink, XCircle, FolderOpen } from 'lucide-react-native';
+import { Download, Trash2, Plus, X, ExternalLink, XCircle, FolderOpen, Pause, Play, RotateCcw, RefreshCw, CheckCircle2 } from 'lucide-react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTheme } from '@/lib/theme-context';
 import { useResponsive } from '@/lib/use-responsive';
@@ -10,6 +10,10 @@ import RNFS from 'react-native-fs';
 import { unzip } from 'react-native-zip-archive';
 import { WebView } from 'react-native-webview';
 import StaticServer from '@dr.pogodin/react-native-static-server';
+import NetInfo from '@react-native-community/netinfo';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+type DownloadStatus = 'NOT_DOWNLOADED' | 'DOWNLOADING' | 'EXTRACTING' | 'PAUSED' | 'DOWNLOADED' | 'UPDATE_AVAILABLE' | 'FAILED';
 
 type DownloadItem = {
   id: string;
@@ -17,11 +21,17 @@ type DownloadItem = {
   downloadUrl: string;
   title?: string;
   description?: string;
-  isDownloaded: boolean;
+  fileSize?: number;
+  status: DownloadStatus;
   localUri?: string;
   isZip?: boolean;
   unzippedPath?: string;
   indexHtmlPath?: string;
+  progress: number;
+  downloadedBytes?: number;
+  createdAt?: string;
+  jobId?: number;
+  isResumedDownload?: boolean;
 };
 
 export default function DownloadsScreen() {
@@ -32,9 +42,12 @@ export default function DownloadsScreen() {
   
   const [downloads, setDownloads] = useState<DownloadItem[]>([]);
   const [downloading, setDownloading] = useState<string | null>(null);
-  const [downloadProgress, setDownloadProgress] = useState<{ [key: string]: number }>({});
   const [showAddModal, setShowAddModal] = useState(false);
+  const [showConfirmModal, setShowConfirmModal] = useState<DownloadItem | null>(null);
   const [showVirtualTour, setShowVirtualTour] = useState<string | null>(null);
+  const [totalStorageUsed, setTotalStorageUsed] = useState(0);
+  const [isWifi, setIsWifi] = useState<boolean | null>(true);
+  
   const [newDownload, setNewDownload] = useState({
     imageUrl: '',
     downloadUrl: '',
@@ -42,8 +55,12 @@ export default function DownloadsScreen() {
     description: '',
   });
 
+  const downloadResumableRef = React.useRef<{ [key: string]: any }>({});
+
   const [serverUrl, setServerUrl] = useState<string | null>(null);
   const serverRef = React.useRef<any>(null);
+  const isPausedRef = React.useRef<{ [key: string]: boolean }>({});
+  const isCancelledRef = React.useRef<{ [key: string]: boolean }>({});
 
   const stopServer = useCallback(async () => {
     if (serverRef.current) {
@@ -60,16 +77,121 @@ export default function DownloadsScreen() {
 
   const downloadsQuery = trpc.downloads.getAll.useQuery();
 
+  // Load persisted downloads from AsyncStorage on mount
+  React.useEffect(() => {
+    const loadPersistedDownloads = async () => {
+      try {
+        const jsonValue = await AsyncStorage.getItem('@offline_tours');
+        if (jsonValue != null) {
+          const persisted = JSON.parse(jsonValue);
+          // Reset any items stuck in DOWNLOADING or containing active jobIds
+          const sanitized = persisted.map((item: DownloadItem) => {
+            if (item.status === 'DOWNLOADING') {
+              return { ...item, status: 'PAUSED', jobId: undefined };
+            }
+            return { ...item, jobId: undefined };
+          });
+          setDownloads(sanitized);
+        }
+      } catch (e) {
+        console.error('Failed to load persisted downloads', e);
+      }
+    };
+    loadPersistedDownloads();
+  }, []);
+
+  // Save downloads to AsyncStorage whenever they change
+  React.useEffect(() => {
+    const savePersistedDownloads = async () => {
+      try {
+        await AsyncStorage.setItem('@offline_tours', JSON.stringify(downloads));
+      } catch (e) {
+        console.error('Failed to save persisted downloads', e);
+      }
+    };
+    if (downloads.length > 0) {
+      savePersistedDownloads();
+    }
+  }, [downloads]);
+
+  // Monitor Network
+  React.useEffect(() => {
+    const unsubscribe = NetInfo.addEventListener(state => {
+      setIsWifi(state.type === 'wifi');
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Calculate storage used
+  React.useEffect(() => {
+    const calculateStorage = async () => {
+      let total = 0;
+      for (const item of downloads) {
+        if (item.status === 'DOWNLOADED' && item.localUri) {
+          try {
+            const path = item.localUri.replace('file://', '');
+            const exists = await RNFS.exists(path);
+            if (exists) {
+              const stat = await RNFS.stat(path);
+              total += stat.size;
+            }
+            if (item.unzippedPath) {
+              const unzipPath = item.unzippedPath.replace('file://', '');
+              const unzipExists = await RNFS.exists(unzipPath);
+              if (unzipExists) {
+                // Approximate directory size or iterate files (simplified for now)
+                // RNFS doesn't have a direct dir size, we could recurse but let's keep it simple
+                // or just use the ZIP size as a baseline
+              }
+            }
+          } catch (err) {
+            console.error('Error calculating file size:', err);
+          }
+        }
+      }
+      setTotalStorageUsed(total);
+    };
+    calculateStorage();
+  }, [downloads]);
+
   React.useEffect(() => {
     if (downloadsQuery.data) {
       setDownloads(prev => {
-        const newItems = downloadsQuery.data.filter(
-          serverItem => !prev.find(localItem => localItem.id === serverItem.id)
-        );
-        return [...prev, ...newItems.map(item => ({
-          ...item,
-          isDownloaded: false,
-        }))];
+        const updatedItems = [...prev];
+        
+        downloadsQuery.data.forEach(serverItem => {
+          const existingIndex = prev.findIndex(localItem => localItem.id === serverItem.id);
+          
+          if (existingIndex === -1) {
+            // New item
+            updatedItems.push({
+              ...serverItem,
+              status: 'NOT_DOWNLOADED',
+              progress: 0,
+            });
+          } else {
+            // Check for update
+            const localItem = prev[existingIndex];
+            const serverCreatedAt = new Date(serverItem.createdAt).getTime();
+            const localCreatedAt = localItem.createdAt ? new Date(localItem.createdAt).getTime() : 0;
+            
+            if (serverCreatedAt > localCreatedAt && localItem.status === 'DOWNLOADED') {
+              updatedItems[existingIndex] = {
+                ...localItem,
+                ...serverItem, // Update metadata
+                status: 'UPDATE_AVAILABLE',
+              };
+            } else if (localItem.status === 'NOT_DOWNLOADED' || localItem.status === 'FAILED') {
+               // Sync metadata if not yet downloaded
+               updatedItems[existingIndex] = {
+                 ...localItem,
+                 ...serverItem,
+               };
+            }
+          }
+        });
+        
+        return updatedItems;
       });
     }
   }, [downloadsQuery.data]);
@@ -201,247 +323,395 @@ export default function DownloadsScreen() {
     }
   };
 
-  const handleDownload = async (item: DownloadItem) => {
-    console.log('===== DOWNLOAD STARTING =====');
+  const handleDownload = async (item: DownloadItem, forceCellular = false, isResume = false) => {
+    if (downloading && downloading !== item.id) {
+      Alert.alert('Download in Progress', 'Please wait for the current download to finish or pause it first.');
+      return;
+    }
+
+    if (!forceCellular && !isWifi) {
+      setShowConfirmModal(item);
+      return;
+    }
+
+    console.log(isResume ? '===== DOWNLOAD RESUMING =====' : '===== DOWNLOAD STARTING =====');
     console.log('Item:', item.title || item.id);
-    console.log('Download URL:', item.downloadUrl);
     
     setDownloading(item.id);
-    setDownloadProgress(prev => ({ ...prev, [item.id]: 0 }));
+    isPausedRef.current[item.id] = false;
+    isCancelledRef.current[item.id] = false;
+
+    setDownloads(prev => prev.map(d => 
+      d.id === item.id ? { ...d, status: 'DOWNLOADING' } : d
+    ));
 
     try {
       const directUrl = convertToDirectDownloadUrl(item.downloadUrl);
       const isZip = isZipFile(directUrl);
 
-      console.log('Direct URL:', directUrl);
-      console.log('Is ZIP:', isZip);
-
       if (Platform.OS === 'web') {
         await Linking.openURL(directUrl);
         setDownloads(prev =>
           prev.map(d =>
-            d.id === item.id ? { ...d, isDownloaded: true, isZip } : d
+            d.id === item.id ? { ...d, status: 'DOWNLOADED', progress: 100, isZip } : d
           )
         );
         setDownloading(null);
-        setDownloadProgress(prev => {
-          const newProgress = { ...prev };
-          delete newProgress[item.id];
-          return newProgress;
-        });
-        Alert.alert('Success', 'Download started in your browser!');
+        Alert.alert('Success', 'Offline content download started in your browser!');
         return;
       }
 
-      console.log('Creating downloads directory...');
       const downloadsDir = `${RNFS.CachesDirectoryPath}/downloads`;
-      const downloadsDirExists = await RNFS.exists(downloadsDir);
-      if (!downloadsDirExists) {
+      if (!(await RNFS.exists(downloadsDir))) {
         await RNFS.mkdir(downloadsDir);
       }
-      console.log('Downloads dir created:', downloadsDir);
       
-      setDownloadProgress(prev => ({ ...prev, [item.id]: 5 }));
-      
-      const fileName = `download_${item.id}_${Date.now()}.${isZip ? 'zip' : 'file'}`;
+      // Use a consistent filename based on item id
+      const fileName = `tour_${item.id}.${isZip ? 'zip' : 'file'}`;
       const downloadedFilePath = `${downloadsDir}/${fileName}`;
-      console.log('Target file:', downloadedFilePath);
       
-      console.log('Starting download with react-native-fs...');
-      setDownloadProgress(prev => ({ ...prev, [item.id]: 10 }));
-      
-      const downloadResult = await RNFS.downloadFile({
+      let resumeOffset = 0;
+      let isResumedDownload = false;
+      if (isResume && await RNFS.exists(downloadedFilePath)) {
+        const stat = await RNFS.stat(downloadedFilePath);
+        resumeOffset = stat.size;
+        isResumedDownload = resumeOffset > 0;
+      } else {
+        // Fresh download, clear existing file if any
+        if (await RNFS.exists(downloadedFilePath)) {
+          await RNFS.unlink(downloadedFilePath);
+        }
+      }
+      setDownloads(prev =>
+        prev.map(d =>
+          d.id === item.id
+            ? { ...d, isResumedDownload }
+            : d
+        )
+      );
+
+      const headers: { [key: string]: string } = {
+        'User-Agent': 'Mozilla/5.0 (Mobile; rv:1.0) Gecko/1.0 Firefox/1.0',
+      };
+
+      if (resumeOffset > 0) {
+        headers['Range'] = `bytes=${resumeOffset}-`;
+      }
+
+      // If resuming, download to a temp file then append
+      const targetPath = resumeOffset > 0 ? `${downloadedFilePath}.tmp` : downloadedFilePath;
+
+      const downloadJob = RNFS.downloadFile({
         fromUrl: directUrl,
-        toFile: downloadedFilePath,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Mobile; rv:1.0) Gecko/1.0 Firefox/1.0',
-        },
+        toFile: targetPath,
+        headers,
         progress: (res) => {
-          const progress = Math.floor((res.bytesWritten / res.contentLength) * 60) + 10;
-          setDownloadProgress(prev => ({ ...prev, [item.id]: progress }));
+          //  prevent native crash after pause
+          if (isPausedRef.current[item.id]) return;
+
+          const currentTotalWritten = resumeOffset + res.bytesWritten;
+          const totalSize =
+            (item.fileSize || res.contentLength) +
+            (resumeOffset > 0 ? resumeOffset : 0);
+
+          const progress = Math.min(
+            99,
+            Math.floor((currentTotalWritten / totalSize) * 100)
+          );
+
+          setDownloads(prev =>
+            prev.map(d =>
+              d.id === item.id
+                ? {
+                    ...d,
+                    progress,
+                    downloadedBytes: currentTotalWritten,
+                    fileSize: totalSize,
+                  }
+                : d
+            )
+          );
         },
+
         progressDivider: 1,
-      }).promise;
+      });
+
+      downloadResumableRef.current[item.id] = downloadJob;
+      setDownloads(prev => prev.map(d => d.id === item.id ? { ...d, jobId: downloadJob.jobId } : d));
+
+      // IMMEDIATE CHECK: If user paused/cancelled while we were initialized the job
+      if (isPausedRef.current[item.id]) {
+        console.log('User requested pause during initialization, stopping immediately.');
+        try { RNFS.stopDownload(downloadJob.jobId); } catch (e) { console.log(e); }
+      }
+      if (isCancelledRef.current[item.id]) {
+        console.log('User requested cancel during initialization, stopping immediately.');
+        try { RNFS.stopDownload(downloadJob.jobId); } catch (e) { console.log(e); }
+      }
+
+      const downloadResult = await downloadJob.promise;
       
-      console.log('Download completed. Status:', downloadResult.statusCode);
+      // CRITICAL: Clear native job ref immediately after it settles
+      delete downloadResumableRef.current[item.id];
       
-      if (downloadResult.statusCode >= 400) {
+      // Check for interruption early
+      if (isCancelledRef.current[item.id] || isPausedRef.current[item.id]) {
+        return;
+      }
+
+      if (downloadResult.statusCode >= 400 && downloadResult.statusCode !== 206) {
         throw new Error(`Server returned status code ${downloadResult.statusCode}`);
       }
-      const fileExists = await RNFS.exists(downloadedFilePath);
-      
-      if (!fileExists) {
-        throw new Error('Downloaded file missing from disk. Download might have failed silently.');
-      }
-      
-      const fileStat = await RNFS.stat(downloadedFilePath);
-      console.log('Result path:', downloadedFilePath);
-      console.log('File exists:', fileExists);
-      console.log('File size:', fileStat.size);
-      
-      const result = {
-        uri: `file://${downloadedFilePath}`,
-        exists: fileExists,
-        size: fileStat.size,
-      };
-      
-      setDownloadProgress(prev => ({ ...prev, [item.id]: 70 }));
-      
-      if (!result.exists || result.size === 0) {
-        throw new Error('Downloaded file is empty or does not exist.');
-      }
-      
-      if (result.size < 100) {
-        const fileContent = await RNFS.readFile(downloadedFilePath, 'utf8');
-        console.error('Response preview:', fileContent.substring(0, 500));
+
+      // If we used a temp file for resume, append it and delete temp
+      if (resumeOffset > 0 && await RNFS.exists(targetPath)) {
+        console.log('Appending resumed chunk safely...');
+        const CHUNK_SIZE = 1024 * 256; // 256KB chunks
+        const stat = await RNFS.stat(targetPath);
+        let bytesRead = 0;
         
-        if (fileContent.includes('Google Drive') || fileContent.includes('<!DOCTYPE') || fileContent.includes('<html')) {
-          throw new Error('Google Drive file is not publicly accessible. Please:\n\n1. Right-click the file in Google Drive\n2. Click "Share"\n3. Set to "Anyone with the link" can VIEW\n4. Copy the share link and try again');
+        while (bytesRead < stat.size) {
+          // Check BEFORE every single bridge call
+          if (isCancelledRef.current[item.id] || isPausedRef.current[item.id]) break;
+
+          const length = Math.min(CHUNK_SIZE, stat.size - bytesRead);
+          const chunk = await RNFS.read(targetPath, length, bytesRead, 'base64');
+  
+          if (isCancelledRef.current[item.id] || isPausedRef.current[item.id]) break;
+          await RNFS.appendFile(downloadedFilePath, chunk, 'base64');
+  
+          bytesRead += length;
         }
-        
-        throw new Error('The download link did not return a valid file. Please ensure the file is publicly accessible.');
+        // Delete the temp file ONLY if we weren't interrupted
+        if (!isCancelledRef.current[item.id] && !isPausedRef.current[item.id]) {
+          await RNFS.unlink(targetPath);
+        }
       }
       
-      console.log('File verification: EXISTS');
-      console.log('Downloaded file path:', result.uri);
-      setDownloadProgress(prev => ({ ...prev, [item.id]: 80 }));
-      
+      if (isCancelledRef.current[item.id] || isPausedRef.current[item.id]) return;
+
+      // Transition to EXTRACTING state
+      setDownloads(prev => prev.map(d => d.id === item.id ? { ...d, status: 'EXTRACTING', progress: 99.5 } : d));
+
       let indexHtmlPath: string | undefined;
       let unzippedPath: string | undefined;
       
       if (isZip) {
-        console.log('===== UNZIPPING FILE =====');
-        setDownloadProgress(prev => ({ ...prev, [item.id]: 85 }));
-        try {
-          const extractedPath = await unzipFile(result.uri, item.id);
-          if (extractedPath) {
-            indexHtmlPath = extractedPath;
-            if (extractedPath.includes('/')) {
-              unzippedPath = extractedPath.split('/').slice(0, -1).join('/');
-            } else {
-              unzippedPath = extractedPath;
-            }
-            console.log('Unzipped successfully!');
-            console.log('Unzipped path:', unzippedPath);
-            console.log('Index HTML:', indexHtmlPath);
-          }
-          setDownloadProgress(prev => ({ ...prev, [item.id]: 95 }));
-        } catch (unzipError: any) {
-          console.error('===== UNZIP FAILED =====');
-          console.error('Error:', unzipError);
-          const errorMsg = unzipError?.message || 'Failed to extract ZIP file';
-          Alert.alert('Extraction Failed', errorMsg);
+        const extractedPath = await unzipFile(`file://${downloadedFilePath}`, item.id);
+        
+        if (isCancelledRef.current[item.id] || isPausedRef.current[item.id]) {
+          // Cleanup unzipped stuff if stopped mid-way
+          return;
+        }
+
+        if (extractedPath) {
+          indexHtmlPath = extractedPath;
+          unzippedPath = extractedPath.includes('/') ? extractedPath.split('/').slice(0, -1).join('/') : extractedPath;
         }
       }
-      
-      setDownloadProgress(prev => ({ ...prev, [item.id]: 100 }));
       
       setDownloads(prev =>
         prev.map(d =>
           d.id === item.id ? {
             ...d,
-            isDownloaded: true,
-            localUri: result.uri,
+            status: 'DOWNLOADED',
+            progress: 100,
+            localUri: `file://${downloadedFilePath}`,
             isZip,
             unzippedPath,
             indexHtmlPath,
+            jobId: undefined,
+            isResumedDownload: false,
           } : d
         )
       );
-      
-      setTimeout(() => {
-        Alert.alert(
-          'Success',
-          isZip && indexHtmlPath
-            ? 'Virtual tour downloaded and extracted successfully! Tap the image to view it.'
-            : 'File downloaded successfully! Tap the image to view it.'
-        );
-      }, 300);
     } catch (error: any) {
-      console.error('===== DOWNLOAD FAILED =====');
-      console.error('Error type:', error?.constructor?.name);
-      console.error('Error message:', error?.message);
-      console.error('Error stack:', error?.stack);
+      console.error('===== DOWNLOAD FAILED =====', error);
       
-      let errorMessage = error?.message || 'Failed to download file.';
-      
-      if (error?.message?.includes('401')) {
-        errorMessage = 'Authentication required. Please ensure:\n\n' +
-          '• Google Drive: File must be publicly accessible\n' +
-          '• Dropbox: Use public share link\n' +
-          '• S3/Azure: File must have public read access or use pre-signed URL';
-      } else if (error?.message?.includes('403')) {
-        errorMessage = 'Access denied. Make sure the file is publicly accessible.';
-      } else if (error?.message?.includes('404')) {
-        errorMessage = 'File not found. Please check the URL.';
-      } else if (error?.message?.includes('Network request failed')) {
-        errorMessage = 'Network error. Please check your internet connection and try again.';
-      } else if (error?.message?.includes('fetch')) {
-        errorMessage = 'Failed to fetch file: ' + error.message;
+      const wasUserPaused = isPausedRef.current[item.id];
+      const wasUserCancelled = isCancelledRef.current[item.id];
+
+      if (wasUserCancelled) {
+        console.log('Download was cancelled by user.');
+        setDownloads(prev => prev.map(d => d.id === item.id ? { 
+          ...d, 
+          status: 'NOT_DOWNLOADED', 
+          progress: 0, 
+          jobId: undefined, 
+          downloadedBytes: 0,
+          isResumedDownload: false
+        } : d));
+        
+        // Final cleanup of files if necessary
+        cleanUpFiles(item.id, item.downloadUrl);
+      } else if (wasUserPaused) {
+        console.log('Download was paused by user.');
+        setDownloads(prev => prev.map(d => d.id === item.id ? { ...d, status: 'PAUSED', jobId: undefined } : d));
+      } else {
+        setDownloads(prev => prev.map(d => d.id === item.id ? { ...d, status: 'FAILED', jobId: undefined } : d));
+        if (error?.message !== 'Download has been stopped') {
+          Alert.alert('Download Error', error?.message || 'Failed to download for offline viewing.');
+        }
       }
-      
-      Alert.alert('Download Error', errorMessage);
     } finally {
-      console.log('===== DOWNLOAD CLEANUP =====');
       setDownloading(null);
       setTimeout(() => {
-        setDownloadProgress(prev => {
-          const newProgress = { ...prev };
-          delete newProgress[item.id];
-          return newProgress;
-        });
+        delete downloadResumableRef.current[item.id];
+        delete isPausedRef.current[item.id];
+        delete isCancelledRef.current[item.id];
       }, 500);
+    }
+  };
+
+  const cleanUpFiles = async (itemId: string, downloadUrl: string) => {
+    const downloadsDir = `${RNFS.CachesDirectoryPath}/downloads`;
+    const isZip = isZipFile(downloadUrl);
+    const fileName = `tour_${itemId}.${isZip ? 'zip' : 'file'}`;
+    const downloadedFilePath = `${downloadsDir}/${fileName}`;
+    if (await RNFS.exists(downloadedFilePath)) {
+      await RNFS.unlink(downloadedFilePath);
+    }
+    if (await RNFS.exists(`${downloadedFilePath}.tmp`)) {
+      await RNFS.unlink(`${downloadedFilePath}.tmp`);
+    }
+    const unzipDir = `${RNFS.CachesDirectoryPath}/unzipped_${itemId}`;
+    if (await RNFS.exists(unzipDir)) {
+      await RNFS.unlink(unzipDir);
+    }
+  };
+
+  const handlePauseDownload = (itemId: string) => {
+  const job = downloadResumableRef.current[itemId];
+  const isExtracting = downloads.find(d => d.id === itemId)?.status === 'EXTRACTING';
+  
+  if (job && !isExtracting) {
+    isPausedRef.current[itemId] = true;
+    
+    // Use a try-catch specifically for the native call
+    try {
+      if (job.jobId) {
+        RNFS.stopDownload(job.jobId);
+        console.log('Native download stopped for ID:', job.jobId);
+      }
+    } catch (err) {
+      console.log('Native stopDownload failed (already stopped):', err);
+    }
+  }
+};
+
+
+
+  const handleResumeDownload = (item: DownloadItem) => {
+    handleDownload(item, true, true);
+  };
+
+  const handleRetryDownload = (item: DownloadItem) => {
+    handleDownload(item, true, false);
+  };
+
+  const cancelDownload = async (itemId: string) => {
+    const job = downloadResumableRef.current[itemId];
+    isCancelledRef.current[itemId] = true;
+
+    if (job) {
+      console.log('Requesting cancel for:', itemId);
+      try {
+        if (typeof job.jobId === 'number') {
+          RNFS.stopDownload(job.jobId);
+        }
+      } catch (err) {
+        console.warn('Error calling stopDownload during cancel:', err);
+      }
+    } else {
+      // If no active job (or already extracting), trigger manual cleanup
+      const item = downloads.find(d => d.id === itemId);
+      if (item) {
+        cleanUpFiles(itemId, item.downloadUrl);
+        setDownloads(prev => prev.map(d => 
+          d.id === itemId ? { ...d, status: 'NOT_DOWNLOADED', progress: 0, downloadedBytes: 0, jobId: undefined } : d
+        ));
+      }
+    }
+  };
+
+  const handleClearCache = async () => {
+    try {
+      const downloadsDir = `${RNFS.CachesDirectoryPath}/downloads`;
+      if (await RNFS.exists(downloadsDir)) {
+        const files = await RNFS.readDir(downloadsDir);
+        for (const file of files) {
+          if (file.name.endsWith('.tmp') || file.name.endsWith('.file')) {
+            await RNFS.unlink(file.path);
+          }
+        }
+      }
+      Alert.alert('Success', 'Temporary cache cleared.');
+    } catch (error) {
+      console.error('Clear cache error:', error);
+      Alert.alert('Error', 'Failed to clear cache.');
+    }
+  };
+
+  const handleClearAll = () => {
+    Alert.alert(
+      'Clear All Downloads',
+      'Are you sure you want to remove all offline content?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { 
+          text: 'Clear All', 
+          style: 'destructive',
+          onPress: async () => {
+            for (const item of downloads) {
+              if (item.status === 'DOWNLOADED') {
+                await performDelete(item);
+              }
+            }
+          }
+        }
+      ]
+    );
+  };
+
+  const performDelete = async (item: DownloadItem) => {
+    try {
+      if (Platform.OS !== 'web') {
+        if (item.localUri) {
+          const path = item.localUri.replace('file://', '');
+          if (await RNFS.exists(path)) await RNFS.unlink(path);
+        }
+        if (item.unzippedPath) {
+          const path = item.unzippedPath.replace('file://', '');
+          if (await RNFS.exists(path)) await RNFS.unlink(path);
+        }
+      }
+      setDownloads(prev =>
+        prev.map(d =>
+          d.id === item.id ? {
+            ...d,
+            status: 'NOT_DOWNLOADED',
+            localUri: undefined,
+            unzippedPath: undefined,
+            indexHtmlPath: undefined,
+            progress: 0
+          } : d
+        )
+      );
+    } catch (error) {
+      console.error('Delete error:', error);
     }
   };
 
   const handleDelete = async (item: DownloadItem) => {
     Alert.alert(
-      'Delete File',
-      'Are you sure you want to delete this file from your device?',
+      'Delete Offline Content',
+      'Are you sure you want to delete this tour from your device? You can re-download it anytime for offline viewing.',
       [
         { text: 'Cancel', style: 'cancel' },
         {
           text: 'Delete',
           style: 'destructive',
-          onPress: async () => {
-            try {
-              if (Platform.OS !== 'web') {
-                if (item.localUri) {
-                  const path = item.localUri.replace('file://', '');
-                  const exists = await RNFS.exists(path);
-                  if (exists) {
-                    await RNFS.unlink(path);
-                    console.log('File deleted:', path);
-                  }
-                }
-                
-                if (item.unzippedPath) {
-                  const path = item.unzippedPath.replace('file://', '');
-                  const exists = await RNFS.exists(path);
-                  if (exists) {
-                    await RNFS.unlink(path);
-                    console.log('Unzipped folder deleted:', path);
-                  }
-                }
-              }
-              
-              setDownloads(prev =>
-                prev.map(d =>
-                  d.id === item.id ? {
-                    ...d,
-                    isDownloaded: false,
-                    localUri: undefined,
-                    unzippedPath: undefined,
-                    indexHtmlPath: undefined,
-                  } : d
-                )
-              );
-              Alert.alert('Deleted', 'File has been removed from your device.');
-            } catch (error) {
-              console.error('Delete error:', error);
-              Alert.alert('Error', 'Failed to delete file.');
-            }
-          },
+          onPress: () => performDelete(item),
         },
       ]
     );
@@ -487,10 +757,10 @@ export default function DownloadsScreen() {
   }, [stopServer]);
 
   const handleOpenItem = useCallback((item: DownloadItem) => {
-    console.log('Opening item:', item.title || item.id, 'Downloaded:', item.isDownloaded);
+    console.log('Opening item:', item.title || item.id, 'Status:', item.status);
     
-    if (!item.isDownloaded) {
-      Alert.alert('Not Downloaded', 'Please download the file first by tapping the download button.');
+    if (item.status !== 'DOWNLOADED') {
+      Alert.alert('Not Downloaded', 'Please download for offline viewing first.');
       return;
     }
     
@@ -527,19 +797,39 @@ export default function DownloadsScreen() {
         <View style={styles.header}>
           <View>
             <Text style={styles.title}>Downloads</Text>
-            <Text style={styles.subtitle}>Manage your cloud content</Text>
+            <Text style={styles.subtitle}>Offline content</Text>
           </View>
-          <TouchableOpacity
-            style={[styles.addButton, { backgroundColor: colors.accent }]}
-            onPress={() => setShowAddModal(true)}
-          >
-            <Plus size={24} color="#FFFFFF" />
-          </TouchableOpacity>
+          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+            <View style={{ marginRight: 15, alignItems: 'flex-end' }}>
+              <Text style={[styles.helperText, { marginBottom: 0 }]}>Offline Content Storage</Text>
+              <Text style={[styles.itemTitle, { fontSize: 14 }]}>
+                {(totalStorageUsed / (1024 * 1024 * 1024)).toFixed(2)} GB
+              </Text>
+            </View>
+            <TouchableOpacity
+              style={[styles.addButton, { backgroundColor: colors.accent }]}
+              onPress={() => setShowAddModal(true)}
+            >
+              <Plus size={24} color="#FFFFFF" />
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        <View style={{ paddingHorizontal: 20, marginBottom: 10, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+          <Text style={styles.helperText}>Manage your offline content</Text>
+          <View style={{ flexDirection: 'row', gap: 15 }}>
+            <TouchableOpacity onPress={handleClearCache}>
+              <Text style={{ color: colors.accent, fontWeight: 'bold' }}>Clear Cache</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={handleClearAll}>
+              <Text style={{ color: '#FF4444', fontWeight: 'bold' }}>Clear All</Text>
+            </TouchableOpacity>
+          </View>
         </View>
 
         <ScrollView style={styles.content} contentContainerStyle={styles.contentContainer}>
           {downloadsQuery.isLoading && (
-            <Text style={styles.loadingText}>Loading downloads...</Text>
+            <Text style={styles.loadingText}>Loading offline content...</Text>
           )}
           
           {downloads.map((item) => {
@@ -551,14 +841,52 @@ export default function DownloadsScreen() {
                 onPress={() => handleOpenItem(item)}
                 activeOpacity={0.7}
               >
-                <Image
-                  source={{ uri: thumbnailUri }}
-                  style={styles.downloadImage}
-                  resizeMode="cover"
-                  onError={(error) => {
-                    console.error('Image load error for:', thumbnailUri, error.nativeEvent);
-                  }}
-                />
+                <View style={styles.thumbnailContainer}>
+                  <Image
+                    source={{ uri: thumbnailUri }}
+                    style={styles.downloadImage}
+                    resizeMode="cover"
+                    onError={(error) => {
+                      console.error('Image load error for:', thumbnailUri, error.nativeEvent);
+                    }}
+                  />
+                  
+                  {item.status === 'DOWNLOADING' || item.status === 'EXTRACTING' || item.status === 'PAUSED' ? (
+                    <View style={styles.downloadingOverlay}>
+                      {item.status === 'DOWNLOADING' ? (
+                        <ActivityIndicator size="large" color="#FFFFFF" />
+                      ) : item.status === 'EXTRACTING' ? (
+                        <ActivityIndicator size="large" color={colors.accent} />
+                      ) : (
+                        <Pause size={48} color="#FFFFFF" />
+                      )}
+                      <Text style={styles.downloadingText}>
+                        {item.status === 'PAUSED' 
+                          ? 'Download Paused' 
+                          : item.status === 'EXTRACTING'
+                            ? 'Processing...'
+                            : item.progress > 0 
+                              ? `Downloading... ${item.progress}%`
+                              : 'Preparing...'}
+                      </Text>
+                      {item.downloadedBytes !== undefined && item.fileSize && (
+                        <Text style={[styles.downloadingText, { fontSize: 12, marginTop: 4 }]}>
+                          {(item.downloadedBytes / (1024 * 1024)).toFixed(1)}MB / {(item.fileSize / (1024 * 1024)).toFixed(1)}MB
+                        </Text>
+                      )}
+                    </View>
+                  ) : item.status === 'DOWNLOADED' ? (
+                    <View style={styles.statusBadge}>
+                      <CheckCircle2 size={12} color="#4CAF50" />
+                      <Text style={styles.statusBadgeText}>Offline ready</Text>
+                    </View>
+                  ) : item.status === 'UPDATE_AVAILABLE' ? (
+                    <View style={[styles.statusBadge, { backgroundColor: 'rgba(255, 136, 0, 0.2)' }]}>
+                      <RefreshCw size={12} color="#FF8800" />
+                      <Text style={[styles.statusBadgeText, { color: '#FF8800' }]}>Update Available</Text>
+                    </View>
+                  ) : null}
+                </View>
                 
                 {(item.title || item.description) && (
                   <View style={styles.infoContainer}>
@@ -572,15 +900,61 @@ export default function DownloadsScreen() {
                 )}
                 
                 <View style={styles.actionButtons}>
-                  {!item.isDownloaded ? (
+                  {item.status === 'NOT_DOWNLOADED' ? (
                     <TouchableOpacity
                       style={[styles.iconButton, styles.downloadButton]}
                       onPress={() => handleDownload(item)}
-                      disabled={downloading === item.id}
+                      disabled={downloading !== null && downloading !== item.id}
                     >
                       <Download size={22} color="#FFFFFF" />
                     </TouchableOpacity>
-                  ) : (
+                  ) : item.status === 'UPDATE_AVAILABLE' ? (
+                    <TouchableOpacity
+                      style={[styles.iconButton, { backgroundColor: colors.accent }]}
+                      onPress={() => handleRetryDownload(item)}
+                    >
+                      <RefreshCw size={22} color="#FFFFFF" />
+                    </TouchableOpacity>
+                  ) : item.status === 'FAILED' ? (
+                    <TouchableOpacity
+                      style={[styles.iconButton, { backgroundColor: '#FF8800' }]}
+                      onPress={() => handleRetryDownload(item)}
+                    >
+                      <RotateCcw size={22} color="#FFFFFF" />
+                    </TouchableOpacity>
+                  ) : item.status === 'DOWNLOADING' || item.status === 'EXTRACTING' ? (
+                    <View style={{ flexDirection: 'row' }}>
+                      {item.status === 'DOWNLOADING' && (
+                        <TouchableOpacity
+                          style={[styles.iconButton, { backgroundColor: colors.accent, marginRight: 8 }]}
+                          onPress={() => handlePauseDownload(item.id)}
+                        >
+                          <Pause size={22} color="#FFFFFF" />
+                        </TouchableOpacity>
+                      )}
+                      <TouchableOpacity
+                        style={[styles.iconButton, { backgroundColor: '#FF4444' }]}
+                        onPress={() => cancelDownload(item.id)}
+                      >
+                        <X size={22} color="#FFFFFF" />
+                      </TouchableOpacity>
+                    </View>
+                  ) : item.status === 'PAUSED' ? (
+                    <View style={{ flexDirection: 'row' }}>
+                      <TouchableOpacity
+                        style={[styles.iconButton, { backgroundColor: colors.accent, marginRight: 8 }]}
+                        onPress={() => handleResumeDownload(item)}
+                      >
+                        <Play size={22} color="#FFFFFF" />
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={[styles.iconButton, { backgroundColor: '#FF4444' }]}
+                        onPress={() => cancelDownload(item.id)}
+                      >
+                        <X size={22} color="#FFFFFF" />
+                      </TouchableOpacity>
+                    </View>
+                  ) : item.status === 'DOWNLOADED' ? (
                     <>
                       {item.indexHtmlPath && (
                         <TouchableOpacity
@@ -597,7 +971,7 @@ export default function DownloadsScreen() {
                         <Trash2 size={22} color="#FFFFFF" />
                       </TouchableOpacity>
                     </>
-                  )}
+                  ) : null}
                 </View>
                 
                 <TouchableOpacity
@@ -622,19 +996,6 @@ export default function DownloadsScreen() {
                 >
                   <XCircle size={20} color="rgba(255, 255, 255, 0.8)" />
                 </TouchableOpacity>
-                
-                {downloading === item.id && (
-                  <View style={styles.downloadingOverlay}>
-                    <ActivityIndicator size="large" color="#FFFFFF" />
-                    <Text style={styles.downloadingText}>
-                      {downloadProgress[item.id] !== undefined && downloadProgress[item.id] < 50
-                        ? `Downloading... ${downloadProgress[item.id]}%`
-                        : downloadProgress[item.id] !== undefined && downloadProgress[item.id] < 100
-                        ? `Processing... ${downloadProgress[item.id]}%`
-                        : 'Downloading...'}
-                    </Text>
-                  </View>
-                )}
               </TouchableOpacity>
             );
           })}
@@ -752,9 +1113,6 @@ export default function DownloadsScreen() {
             const fileUri = showVirtualTour.startsWith('file://') ? showVirtualTour : `file://${showVirtualTour}`;
             const parentDirectory = fileUri.substring(0, fileUri.lastIndexOf('/'));
             
-            console.log('WebView file URI:', fileUri);
-            console.log('WebView parent directory for iOS read access:', parentDirectory);
-            
             return (
               <WebView
                 source={{
@@ -790,6 +1148,75 @@ export default function DownloadsScreen() {
             );
           })()}
         </SafeAreaView>
+      </Modal>
+
+      {/* Download Confirmation Modal */}
+      <Modal
+        visible={showConfirmModal !== null}
+        animationType="fade"
+        transparent
+        onRequestClose={() => setShowConfirmModal(null)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalContent, { backgroundColor: colors.card, borderTopLeftRadius: 24, borderTopRightRadius: 24 }]}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Download for Offline Viewing</Text>
+              <TouchableOpacity onPress={() => setShowConfirmModal(null)}>
+                <X size={24} color={colors.text} />
+              </TouchableOpacity>
+            </View>
+            
+            <View style={styles.modalBody}>
+              <Text style={[styles.label, { marginBottom: 15 }]}>
+                {showConfirmModal?.title || 'This virtual tour'}
+              </Text>
+              
+              <View style={{ backgroundColor: colors.background, padding: 15, borderRadius: 8, marginBottom: 20 }}>
+                {showConfirmModal?.fileSize && (
+                  <Text style={[styles.infoText, { color: colors.text, fontWeight: 'bold' }]}>
+                    Size: ~{(showConfirmModal.fileSize / (1024 * 1024)).toFixed(1)} MB
+                  </Text>
+                )}
+                <Text style={[styles.infoText, { color: colors.textSecondary, marginTop: 5 }]}>
+                  • Wi-Fi connection is recommended for large downloads.
+                </Text>
+                <Text style={[styles.infoText, { color: colors.textSecondary, marginTop: 5 }]}>
+                  • Content will be stored locally and can be deleted anytime to free up space.
+                </Text>
+                
+                {!isWifi && (
+                  <View style={{ marginTop: 15, padding: 10, backgroundColor: 'rgba(255, 165, 0, 0.1)', borderRadius: 4 }}>
+                    <Text style={{ color: '#FFA500', fontSize: 12, fontWeight: 'bold' }}>
+                      You are currently on a cellular network.
+                    </Text>
+                  </View>
+                )}
+              </View>
+            </View>
+
+            <View style={styles.modalFooter}>
+              <TouchableOpacity
+                style={[styles.modalButton, styles.cancelButton, { backgroundColor: colors.background }]}
+                onPress={() => setShowConfirmModal(null)}
+              >
+                <Text style={[styles.buttonText, { color: colors.text }]}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.modalButton, { backgroundColor: colors.accent, flex: 2 }]}
+                onPress={() => {
+                  if (showConfirmModal) {
+                    handleDownload(showConfirmModal, true);
+                    setShowConfirmModal(null);
+                  }
+                }}
+              >
+                <Text style={styles.buttonText}>
+                  {isWifi ? 'Download for offline viewing' : 'Download anyway'}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
       </Modal>
     </SafeAreaView>
   );
@@ -857,9 +1284,15 @@ const getStyles = (colors: ThemeColors, isTablet: boolean) => StyleSheet.create(
     shadowOpacity: 0.1,
     shadowRadius: 8,
   },
-  downloadImage: {
+  thumbnailContainer: {
+    position: 'relative',
     width: '100%',
     height: isTablet ? 300 : 220,
+    overflow: 'hidden',
+  },
+  downloadImage: {
+    width: '100%',
+    height: '100%',
   },
   infoContainer: {
     padding: GeckoTheme.spacing.md,
@@ -987,6 +1420,11 @@ const getStyles = (colors: ThemeColors, isTablet: boolean) => StyleSheet.create(
     marginTop: GeckoTheme.spacing.xs,
     fontStyle: 'italic' as const,
   },
+  infoText: {
+    fontSize: 14,
+    color: colors.text,
+    lineHeight: 20,
+  },
   modalFooter: {
     flexDirection: 'row',
     padding: GeckoTheme.spacing.lg,
@@ -1026,5 +1464,23 @@ const getStyles = (colors: ThemeColors, isTablet: boolean) => StyleSheet.create(
   },
   closeButton: {
     padding: GeckoTheme.spacing.sm,
+  },
+  statusBadge: {
+    position: 'absolute' as const,
+    top: GeckoTheme.spacing.md,
+    left: GeckoTheme.spacing.md,
+    backgroundColor: 'rgba(76, 175, 80, 0.2)',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 4,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  statusBadgeText: {
+    fontSize: 10,
+    fontWeight: '700' as const,
+    color: '#4CAF50',
+    textTransform: 'uppercase' as const,
   },
 });

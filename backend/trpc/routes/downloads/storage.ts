@@ -4,6 +4,7 @@ type DownloadItem = {
   downloadUrl: string;
   title?: string;
   description?: string;
+  fileSize?: number; // Size in bytes
   createdAt: string;
 };
 
@@ -15,6 +16,7 @@ export class DownloadStorage {
       downloadUrl: "https://images.unsplash.com/photo-1618773928121-c32242e63f39?w=800",
       title: "Demo PDF File",
       description: "A sample PDF file for testing downloads",
+      fileSize: 1024 * 1024 * 5, // 5MB
       createdAt: new Date().toISOString(),
     },
     {
@@ -23,6 +25,7 @@ export class DownloadStorage {
       downloadUrl: "https://raw.githubusercontent.com/mdn/learning-area/master/html/multimedia-and-embedding/images-in-html/dinosaur.jpg",
       title: "Sample Image",
       description: "A sample image for testing cloud downloads",
+      fileSize: 1024 * 500, // 500KB
       createdAt: new Date().toISOString(),
     },
   ];

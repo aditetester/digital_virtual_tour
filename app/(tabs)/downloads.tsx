@@ -6,7 +6,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTheme } from '@/lib/theme-context';
 import { useResponsive } from '@/lib/use-responsive';
 import { trpc } from '@/lib/trpc';
-import RNFS from 'react-native-fs';
+import * as RNFS from '@dr.pogodin/react-native-fs';
 import { unzip } from 'react-native-zip-archive';
 import { WebView } from 'react-native-webview';
 import StaticServer from '@dr.pogodin/react-native-static-server';
@@ -406,8 +406,8 @@ export default function DownloadsScreen() {
         toFile: targetPath,
         headers,
         progress: (res) => {
-          //  prevent native crash after pause
-          if (isPausedRef.current[item.id]) return;
+          // prevent native crash after pause or cancel
+          if (isPausedRef.current[item.id] || isCancelledRef.current[item.id]) return;
 
           const currentTotalWritten = resumeOffset + res.bytesWritten;
           const totalSize =
@@ -526,13 +526,11 @@ export default function DownloadsScreen() {
         )
       );
     } catch (error: any) {
-      console.error('===== DOWNLOAD FAILED =====', error);
-      
       const wasUserPaused = isPausedRef.current[item.id];
       const wasUserCancelled = isCancelledRef.current[item.id];
 
       if (wasUserCancelled) {
-        console.log('Download was cancelled by user.');
+        console.log('Download was cancelled by user (Graceful)');
         setDownloads(prev => prev.map(d => d.id === item.id ? { 
           ...d, 
           status: 'NOT_DOWNLOADED', 
@@ -545,11 +543,14 @@ export default function DownloadsScreen() {
         // Final cleanup of files if necessary
         cleanUpFiles(item.id, item.downloadUrl);
       } else if (wasUserPaused) {
-        console.log('Download was paused by user.');
+        console.log('Download was paused by user (Graceful)');
         setDownloads(prev => prev.map(d => d.id === item.id ? { ...d, status: 'PAUSED', jobId: undefined } : d));
       } else {
+        console.error('===== DOWNLOAD FAILED =====', error);
         setDownloads(prev => prev.map(d => d.id === item.id ? { ...d, status: 'FAILED', jobId: undefined } : d));
-        if (error?.message !== 'Download has been stopped') {
+        
+        const ignoredMessages = ['Download has been stopped', 'Download has been aborted'];
+        if (!ignoredMessages.includes(error?.message)) {
           Alert.alert('Download Error', error?.message || 'Failed to download for offline viewing.');
         }
       }
@@ -580,24 +581,29 @@ export default function DownloadsScreen() {
     }
   };
 
-  const handlePauseDownload = (itemId: string) => {
-  const job = downloadResumableRef.current[itemId];
-  const isExtracting = downloads.find(d => d.id === itemId)?.status === 'EXTRACTING';
-  
-  if (job && !isExtracting) {
+  const handlePauseDownload = useCallback((itemId: string) => {
     isPausedRef.current[itemId] = true;
+    const job = downloadResumableRef.current[itemId];
+    const item = downloads.find(d => d.id === itemId);
+    const isExtracting = item?.status === 'EXTRACTING';
     
-    // Use a try-catch specifically for the native call
-    try {
-      if (job.jobId) {
-        RNFS.stopDownload(job.jobId);
-        console.log('Native download stopped for ID:', job.jobId);
+    if (job && !isExtracting) {
+      console.log('Requesting pause for:', itemId, 'Job ID:', job.jobId);
+      // Use a try-catch and check jobId existence
+      try {
+        if (job.jobId !== undefined && job.jobId !== null) {
+          RNFS.stopDownload(job.jobId);
+          console.log('Native stopDownload called for ID:', job.jobId);
+        }
+      } catch (err) {
+        console.log('Native stopDownload failed or already stopped:', err);
       }
-    } catch (err) {
-      console.log('Native stopDownload failed (already stopped):', err);
+    } else {
+      console.log('No active job to pause or already extracting for:', itemId);
+      // If already extracting or no job, we just mark it as paused for state sync
+      setDownloads(prev => prev.map(d => d.id === itemId ? { ...d, status: 'PAUSED', jobId: undefined } : d));
     }
-  }
-};
+  }, [downloads]);
 
 
 
@@ -610,28 +616,31 @@ export default function DownloadsScreen() {
   };
 
   const cancelDownload = async (itemId: string) => {
-    const job = downloadResumableRef.current[itemId];
     isCancelledRef.current[itemId] = true;
+    const job = downloadResumableRef.current[itemId];
+    console.log('Requesting cancel for:', itemId, 'Job ID:', job?.jobId);
 
     if (job) {
-      console.log('Requesting cancel for:', itemId);
       try {
-        if (typeof job.jobId === 'number') {
+        if (job.jobId !== undefined && job.jobId !== null) {
           RNFS.stopDownload(job.jobId);
+          console.log('Native stopDownload called during cancel for ID:', job.jobId);
         }
       } catch (err) {
         console.warn('Error calling stopDownload during cancel:', err);
       }
-    } else {
-      // If no active job (or already extracting), trigger manual cleanup
-      const item = downloads.find(d => d.id === itemId);
-      if (item) {
-        cleanUpFiles(itemId, item.downloadUrl);
-        setDownloads(prev => prev.map(d => 
-          d.id === itemId ? { ...d, status: 'NOT_DOWNLOADED', progress: 0, downloadedBytes: 0, jobId: undefined } : d
-        ));
-      }
     }
+
+    // Always perform cleanup and state update on cancel
+    const item = downloads.find(d => d.id === itemId);
+    if (item) {
+      await cleanUpFiles(itemId, item.downloadUrl);
+      setDownloads(prev => prev.map(d => 
+        d.id === itemId ? { ...d, status: 'NOT_DOWNLOADED', progress: 0, downloadedBytes: 0, jobId: undefined } : d
+      ));
+    }
+    
+    setDownloading(null);
   };
 
   const handleClearCache = async () => {

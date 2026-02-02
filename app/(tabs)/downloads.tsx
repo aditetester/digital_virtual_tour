@@ -1081,9 +1081,10 @@ export default function DownloadsScreen() {
                 keyboardVerticalOffset={Platform.OS === 'ios' ? 100 : 0}
                 style={{ flexShrink: 1, width: '100%' }}
               >
-                <ScrollView 
+                <ScrollView
+                  showsVerticalScrollIndicator={false}
                   style={styles.modalBody}
-                  contentContainerStyle={[styles.modalBodyContent, { paddingBottom: 300 }]}
+                  contentContainerStyle={[styles.modalBodyContent, { paddingBottom: 200 }]}
                   keyboardShouldPersistTaps="handled"
                 >
                   <Text style={styles.label}>Image URL *</Text>

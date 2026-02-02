@@ -1,5 +1,5 @@
 import React, { useState, useCallback } from 'react';
-import { StyleSheet, View, Text, ScrollView, TouchableOpacity, Alert, Image, TextInput, Modal, Linking, Platform, ActivityIndicator } from 'react-native';
+import { StyleSheet, View, Text, ScrollView, TouchableOpacity, Alert, Image, TextInput, Modal, Linking, Platform, ActivityIndicator, KeyboardAvoidingView, Keyboard } from 'react-native';
 import { getThemeColors, GeckoTheme, ThemeColors } from '@/constants/theme';
 import { Download, Trash2, Plus, X, ExternalLink, XCircle, FolderOpen, Pause, Play, RotateCcw, RefreshCw, CheckCircle2 } from 'lucide-react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -68,7 +68,7 @@ export default function DownloadsScreen() {
         await serverRef.current.stop();
         console.log('Local server stopped');
       } catch (err) {
-        console.error('Error stopping server:', err);
+        console.log('Error stopping server:', err);
       }
       serverRef.current = null;
     }
@@ -94,7 +94,7 @@ export default function DownloadsScreen() {
           setDownloads(sanitized);
         }
       } catch (e) {
-        console.error('Failed to load persisted downloads', e);
+        console.log('Failed to load persisted downloads', e);
       }
     };
     loadPersistedDownloads();
@@ -106,7 +106,7 @@ export default function DownloadsScreen() {
       try {
         await AsyncStorage.setItem('@offline_tours', JSON.stringify(downloads));
       } catch (e) {
-        console.error('Failed to save persisted downloads', e);
+        console.log('Failed to save persisted downloads', e);
       }
     };
     if (downloads.length > 0) {
@@ -145,7 +145,7 @@ export default function DownloadsScreen() {
               }
             }
           } catch (err) {
-            console.error('Error calculating file size:', err);
+            console.log('Error calculating file size:', err);
           }
         }
       }
@@ -318,7 +318,7 @@ export default function DownloadsScreen() {
       console.log(`Unzip process finished. Index HTML: ${indexHtmlPath}`);
       return indexHtmlPath || unzipDir;
     } catch (error) {
-      console.error('Unzip error:', error);
+      console.log('Unzip error:', error);
       throw error;
     }
   };
@@ -369,19 +369,50 @@ export default function DownloadsScreen() {
       // Use a consistent filename based on item id
       const fileName = `tour_${item.id}.${isZip ? 'zip' : 'file'}`;
       const downloadedFilePath = `${downloadsDir}/${fileName}`;
+      const tempPath = `${downloadedFilePath}.tmp`;
       
       let resumeOffset = 0;
       let isResumedDownload = false;
-      if (isResume && await RNFS.exists(downloadedFilePath)) {
-        const stat = await RNFS.stat(downloadedFilePath);
-        resumeOffset = stat.size;
-        isResumedDownload = resumeOffset > 0;
-      } else {
-        // Fresh download, clear existing file if any
-        if (await RNFS.exists(downloadedFilePath)) {
-          await RNFS.unlink(downloadedFilePath);
+
+      if (isResume) {
+        // 1. CONSOLIDATION: If a previous .tmp exists, append it to the main file FIRST
+        // This ensures if we were paused during a resume, we don't lose that progress.
+        if (await RNFS.exists(tempPath)) {
+          console.log('Found existing .tmp file, consolidating before resume...');
+          const CHUNK_SIZE = 1024 * 256;
+          const stat = await RNFS.stat(tempPath);
+          let bytesRead = 0;
+
+          // If the main file doesn't exist but .tmp does, move .tmp to main
+          if (!(await RNFS.exists(downloadedFilePath))) {
+            await RNFS.moveFile(tempPath, downloadedFilePath);
+          } else {
+            while (bytesRead < stat.size) {
+              if (isCancelledRef.current[item.id] || isPausedRef.current[item.id]) break;
+              const length = Math.min(CHUNK_SIZE, stat.size - bytesRead);
+              const chunk = await RNFS.read(tempPath, length, bytesRead, 'base64');
+              await RNFS.appendFile(downloadedFilePath, chunk, 'base64');
+              bytesRead += length;
+            }
+            if (!isCancelledRef.current[item.id] && !isPausedRef.current[item.id]) {
+              await RNFS.unlink(tempPath);
+            }
+          }
         }
+
+        // 2. Determine offset from the (now updated) main file
+        if (await RNFS.exists(downloadedFilePath)) {
+          const stat = await RNFS.stat(downloadedFilePath);
+          resumeOffset = stat.size;
+          isResumedDownload = resumeOffset > 0;
+          console.log(`Resuming from offset: ${resumeOffset} bytes`);
+        }
+      } else {
+        // Fresh download, clear existing files
+        if (await RNFS.exists(downloadedFilePath)) await RNFS.unlink(downloadedFilePath);
+        if (await RNFS.exists(tempPath)) await RNFS.unlink(tempPath);
       }
+
       setDownloads(prev =>
         prev.map(d =>
           d.id === item.id
@@ -398,21 +429,25 @@ export default function DownloadsScreen() {
         headers['Range'] = `bytes=${resumeOffset}-`;
       }
 
-      // If resuming, download to a temp file then append
-      const targetPath = resumeOffset > 0 ? `${downloadedFilePath}.tmp` : downloadedFilePath;
+      // Always download to .tmp when resuming to keep main file stable
+      // or to main file if it's a fresh start.
+      const targetPath = resumeOffset > 0 ? tempPath : downloadedFilePath;
 
       const downloadJob = RNFS.downloadFile({
         fromUrl: directUrl,
         toFile: targetPath,
         headers,
         progress: (res) => {
-          // prevent native crash after pause or cancel
           if (isPausedRef.current[item.id] || isCancelledRef.current[item.id]) return;
 
           const currentTotalWritten = resumeOffset + res.bytesWritten;
-          const totalSize =
-            (item.fileSize || res.contentLength) +
-            (resumeOffset > 0 ? resumeOffset : 0);
+          
+          // FIX: If we have item.fileSize, it's already the total. 
+          // res.contentLength is only the REMAINING size when Range is used.
+          let totalSize = item.fileSize;
+          if (!totalSize || totalSize <= 0) {
+             totalSize = res.contentLength + (resumeOffset > 0 ? resumeOffset : 0);
+          }
 
           const progress = Math.min(
             99,
@@ -546,7 +581,7 @@ export default function DownloadsScreen() {
         console.log('Download was paused by user (Graceful)');
         setDownloads(prev => prev.map(d => d.id === item.id ? { ...d, status: 'PAUSED', jobId: undefined } : d));
       } else {
-        console.error('===== DOWNLOAD FAILED =====', error);
+        console.log('===== DOWNLOAD FAILED =====');
         setDownloads(prev => prev.map(d => d.id === item.id ? { ...d, status: 'FAILED', jobId: undefined } : d));
         
         const ignoredMessages = ['Download has been stopped', 'Download has been aborted'];
@@ -656,7 +691,7 @@ export default function DownloadsScreen() {
       }
       Alert.alert('Success', 'Temporary cache cleared.');
     } catch (error) {
-      console.error('Clear cache error:', error);
+      console.log('Clear cache error:', error);
       Alert.alert('Error', 'Failed to clear cache.');
     }
   };
@@ -707,7 +742,7 @@ export default function DownloadsScreen() {
         )
       );
     } catch (error) {
-      console.error('Delete error:', error);
+      console.log('Delete error:', error);
     }
   };
 
@@ -747,7 +782,7 @@ export default function DownloadsScreen() {
           console.log('Static server started at:', fullServerUrl);
           setServerUrl(fullServerUrl);
         } catch (error) {
-          console.error('Failed to start static server:', error);
+          console.log('Failed to start static server:', error);
           setServerUrl(null);
         }
       }
@@ -780,7 +815,7 @@ export default function DownloadsScreen() {
       console.log('Opening file:', item.localUri);
       if (Platform.OS === 'web') {
         Linking.openURL(item.localUri).catch(err => {
-          console.error('Failed to open file:', err);
+          console.log('Failed to open file:', err);
           Alert.alert('Error', 'Failed to open file.');
         });
       } else {
@@ -856,7 +891,7 @@ export default function DownloadsScreen() {
                     style={styles.downloadImage}
                     resizeMode="cover"
                     onError={(error) => {
-                      console.error('Image load error for:', thumbnailUri, error.nativeEvent);
+                      console.log('Image load error for:', thumbnailUri, error.nativeEvent);
                     }}
                   />
                   
@@ -886,7 +921,7 @@ export default function DownloadsScreen() {
                     </View>
                   ) : item.status === 'DOWNLOADED' ? (
                     <View style={styles.statusBadge}>
-                      <CheckCircle2 size={12} color="#4CAF50" />
+                      <CheckCircle2 size={12} color="#ffffffff" />
                       <Text style={styles.statusBadgeText}>Offline ready</Text>
                     </View>
                   ) : item.status === 'UPDATE_AVAILABLE' ? (
@@ -901,7 +936,7 @@ export default function DownloadsScreen() {
                   <View style={styles.infoContainer}>
                     {item.title && <Text style={styles.itemTitle}>{item.title}</Text>}
                     {item.description && (
-                      <Text style={styles.itemDescription} numberOfLines={2}>
+                      <Text style={styles.itemDescription} numberOfLines={5}>
                         {item.description}
                       </Text>
                     )}
@@ -1015,92 +1050,117 @@ export default function DownloadsScreen() {
         visible={showAddModal}
         animationType="slide"
         transparent
-        onRequestClose={() => setShowAddModal(false)}
+        statusBarTranslucent
+        onRequestClose={() => {
+          Keyboard.dismiss();
+          setShowAddModal(false);
+        }}
       >
-        <View style={styles.modalOverlay}>
-          <View style={[styles.modalContent, { backgroundColor: colors.card }]}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Add Cloud URL</Text>
-              <TouchableOpacity onPress={() => setShowAddModal(false)}>
-                <X size={24} color={colors.text} />
-              </TouchableOpacity>
-            </View>
-
-            <ScrollView style={styles.modalBody}>
-              <Text style={styles.label}>Image URL *</Text>
-              <TextInput
-                style={[styles.input, { backgroundColor: colors.background, color: colors.text }]}
-                placeholder="https://example.com/image.jpg"
-                placeholderTextColor={colors.textSecondary}
-                value={newDownload.imageUrl}
-                onChangeText={(text) => setNewDownload(prev => ({ ...prev, imageUrl: text }))}
-                autoCapitalize="none"
-                autoCorrect={false}
-              />
-
-              <Text style={styles.label}>Download URL * (Cloud Storage Link)</Text>
-              <View style={styles.inputWithIcon}>
-                <TextInput
-                  style={[styles.input, { backgroundColor: colors.background, color: colors.text, flex: 1 }]}
-                  placeholder="https://drive.google.com/file/d/... or https://s3.amazonaws.com/..."
-                  placeholderTextColor={colors.textSecondary}
-                  value={newDownload.downloadUrl}
-                  onChangeText={(text) => setNewDownload(prev => ({ ...prev, downloadUrl: text }))}
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                />
-                <ExternalLink size={20} color={colors.textSecondary} style={styles.inputIcon} />
+          <View style={styles.modalOverlay}>
+            <TouchableOpacity 
+              style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 }} 
+              activeOpacity={1} 
+              onPress={() => {
+                Keyboard.dismiss();
+                setShowAddModal(false);
+              }}
+            />
+            <View 
+              style={[styles.modalContent, { backgroundColor: colors.card }]}
+              onStartShouldSetResponder={() => true}
+            >
+              <View style={styles.modalHeader}>
+                <Text style={styles.modalTitle}>Add Cloud URL</Text>
+                <TouchableOpacity onPress={() => setShowAddModal(false)}>
+                  <X size={24} color={colors.text} />
+                </TouchableOpacity>
               </View>
-              <Text style={styles.helperText}>
-                📁 Google Drive ZIP files:{"\n"}
-                   • Right-click file → Share → Anyone with link can VIEW{"\n"}
-                   • Copy the share link{"\n"}
-                   • Link will be auto-converted to direct download{"\n"}
-                {"\n"}
-                📦 Dropbox: Use public share link{"\n"}
-                🔗 Direct links: Must end with .zip and be publicly accessible
-              </Text>
 
-              <Text style={styles.label}>Title (Optional)</Text>
-              <TextInput
-                style={[styles.input, { backgroundColor: colors.background, color: colors.text }]}
-                placeholder="e.g., Project Files 2024"
-                placeholderTextColor={colors.textSecondary}
-                value={newDownload.title}
-                onChangeText={(text) => setNewDownload(prev => ({ ...prev, title: text }))}
-              />
-
-              <Text style={styles.label}>Description (Optional)</Text>
-              <TextInput
-                style={[styles.input, styles.textArea, { backgroundColor: colors.background, color: colors.text }]}
-                placeholder="Add a description..."
-                placeholderTextColor={colors.textSecondary}
-                value={newDownload.description}
-                onChangeText={(text) => setNewDownload(prev => ({ ...prev, description: text }))}
-                multiline
-                numberOfLines={4}
-              />
-            </ScrollView>
-
-            <View style={styles.modalFooter}>
-              <TouchableOpacity
-                style={[styles.modalButton, styles.cancelButton, { backgroundColor: colors.background }]}
-                onPress={() => setShowAddModal(false)}
+              <KeyboardAvoidingView
+                behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+                keyboardVerticalOffset={Platform.OS === 'ios' ? 100 : 0}
+                style={{ flexShrink: 1, width: '100%' }}
               >
-                <Text style={[styles.buttonText, { color: colors.text }]}>Cancel</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.modalButton, styles.addButtonModal, { backgroundColor: colors.accent }]}
-                onPress={handleAddDownload}
-                disabled={addUrlMutation.isPending}
-              >
-                <Text style={styles.buttonText}>
-                  {addUrlMutation.isPending ? 'Adding...' : 'Add'}
-                </Text>
-              </TouchableOpacity>
+                <ScrollView 
+                  style={styles.modalBody}
+                  contentContainerStyle={[styles.modalBodyContent, { paddingBottom: 300 }]}
+                  keyboardShouldPersistTaps="handled"
+                >
+                  <Text style={styles.label}>Image URL *</Text>
+                  <TextInput
+                    style={[styles.input, { backgroundColor: colors.background, color: colors.text }]}
+                    placeholder="https://example.com/image.jpg"
+                    placeholderTextColor={colors.textSecondary}
+                    value={newDownload.imageUrl}
+                    onChangeText={(text) => setNewDownload(prev => ({ ...prev, imageUrl: text }))}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                  />
+
+                  <Text style={styles.label}>Download URL * (Cloud Storage Link)</Text>
+                  <View style={styles.inputWithIcon}>
+                    <TextInput
+                      style={[styles.input, { backgroundColor: colors.background, color: colors.text, flex: 1 }]}
+                      placeholder="https://drive.google.com/file/d/... or https://s3.amazonaws.com/..."
+                      placeholderTextColor={colors.textSecondary}
+                      value={newDownload.downloadUrl}
+                      onChangeText={(text) => setNewDownload(prev => ({ ...prev, downloadUrl: text }))}
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                    />
+                    <ExternalLink size={20} color={colors.textSecondary} style={styles.inputIcon} />
+                  </View>
+                  <Text style={styles.helperText}>
+                    📁 Google Drive ZIP files:{"\n"}
+                       • Right-click file → Share → Anyone with link can VIEW{"\n"}
+                       • Copy the share link{"\n"}
+                       • Link will be auto-converted to direct download{"\n"}
+                    {"\n"}
+                    📦 Dropbox: Use public share link{"\n"}
+                    🔗 Direct links: Must end with .zip and be publicly accessible
+                  </Text>
+
+                  <Text style={styles.label}>Title (Optional)</Text>
+                  <TextInput
+                    style={[styles.input, { backgroundColor: colors.background, color: colors.text }]}
+                    placeholder="e.g., Project Files 2024"
+                    placeholderTextColor={colors.textSecondary}
+                    value={newDownload.title}
+                    onChangeText={(text) => setNewDownload(prev => ({ ...prev, title: text }))}
+                  />
+
+                  <Text style={styles.label}>Description (Optional)</Text>
+                  <TextInput
+                    style={[styles.input, styles.textArea, { backgroundColor: colors.background, color: colors.text }]}
+                    placeholder="Add a description..."
+                    placeholderTextColor={colors.textSecondary}
+                    value={newDownload.description}
+                    onChangeText={(text) => setNewDownload(prev => ({ ...prev, description: text }))}
+                    multiline
+                    numberOfLines={4}
+                  />
+                </ScrollView>
+              </KeyboardAvoidingView>
+
+              <View style={styles.modalFooter}>
+                <TouchableOpacity
+                  style={[styles.modalButton, styles.cancelButton, { backgroundColor: colors.background }]}
+                  onPress={() => setShowAddModal(false)}
+                >
+                  <Text style={[styles.buttonText, { color: colors.text }]}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.modalButton, styles.addButtonModal, { backgroundColor: colors.accent }]}
+                  onPress={handleAddDownload}
+                  disabled={addUrlMutation.isPending}
+                >
+                  <Text style={styles.buttonText}>
+                    {addUrlMutation.isPending ? 'Adding...' : 'Add'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
             </View>
           </View>
-        </View>
       </Modal>
 
       <Modal
@@ -1139,13 +1199,13 @@ export default function DownloadsScreen() {
                 mixedContentMode="always"
                 onError={(syntheticEvent) => {
                   const { nativeEvent } = syntheticEvent;
-                  console.error('WebView error:', nativeEvent);
+                  console.log('WebView error:', nativeEvent);
                   Alert.alert('Error', `Failed to load virtual tour: ${nativeEvent.description || 'Unknown error'}`);
                 }}
                 onLoad={() => console.log('Virtual tour loaded successfully')}
                 onHttpError={(syntheticEvent) => {
                   const { nativeEvent } = syntheticEvent;
-                  console.error('WebView HTTP error:', nativeEvent);
+                  console.log('WebView HTTP error:', nativeEvent);
                 }}
                 renderLoading={() => (
                   <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: colors.background }}>
@@ -1305,6 +1365,8 @@ const getStyles = (colors: ThemeColors, isTablet: boolean) => StyleSheet.create(
   },
   infoContainer: {
     padding: GeckoTheme.spacing.md,
+    paddingRight: 120,
+    justifyContent: 'center',
   },
   itemTitle: {
     fontSize: 16,
@@ -1315,6 +1377,7 @@ const getStyles = (colors: ThemeColors, isTablet: boolean) => StyleSheet.create(
   itemDescription: {
     fontSize: 14,
     color: colors.textSecondary,
+    marginTop: 2,
   },
   actionButtons: {
     position: 'absolute' as const,
@@ -1394,6 +1457,9 @@ const getStyles = (colors: ThemeColors, isTablet: boolean) => StyleSheet.create(
     color: colors.text,
   },
   modalBody: {
+    flexShrink: 1,
+  },
+  modalBodyContent: {
     padding: GeckoTheme.spacing.lg,
   },
   label: {
@@ -1437,6 +1503,7 @@ const getStyles = (colors: ThemeColors, isTablet: boolean) => StyleSheet.create(
   modalFooter: {
     flexDirection: 'row',
     padding: GeckoTheme.spacing.lg,
+    paddingBottom: GeckoTheme.spacing.xxl,
     gap: GeckoTheme.spacing.md,
     borderTopWidth: 1,
     borderTopColor: colors.border,
@@ -1463,6 +1530,7 @@ const getStyles = (colors: ThemeColors, isTablet: boolean) => StyleSheet.create(
     justifyContent: 'space-between',
     alignItems: 'center',
     padding: GeckoTheme.spacing.lg,
+    paddingTop: GeckoTheme.spacing.xxl,
     borderBottomWidth: 1,
     borderBottomColor: colors.border,
   },
@@ -1478,7 +1546,7 @@ const getStyles = (colors: ThemeColors, isTablet: boolean) => StyleSheet.create(
     position: 'absolute' as const,
     top: GeckoTheme.spacing.md,
     left: GeckoTheme.spacing.md,
-    backgroundColor: 'rgba(76, 175, 80, 0.2)',
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
     paddingHorizontal: 8,
     paddingVertical: 4,
     borderRadius: 4,
@@ -1489,7 +1557,7 @@ const getStyles = (colors: ThemeColors, isTablet: boolean) => StyleSheet.create(
   statusBadgeText: {
     fontSize: 10,
     fontWeight: '700' as const,
-    color: '#4CAF50',
+    color: '#ffffffff',
     textTransform: 'uppercase' as const,
   },
 });

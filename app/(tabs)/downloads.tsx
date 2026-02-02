@@ -323,6 +323,204 @@ export default function DownloadsScreen() {
     }
   };
 
+  // iOS-specific chunked download using RNFS.downloadFile for each chunk
+  // Downloads in large chunks (5MB) using native code, then appends to main file
+  // This provides reliable binary download + pause/resume capability
+  const iosDownloadActiveRef = React.useRef<{ [key: string]: boolean }>({});
+  const iosCurrentJobRef = React.useRef<{ [key: string]: number }>({});
+  
+  const downloadWithChunksIOS = async (
+    itemId: string,
+    url: string, 
+    targetPath: string, 
+    resumeOffset: number,
+    totalFileSize: number | undefined,
+    onProgress: (bytesWritten: number, totalBytes: number) => void
+  ): Promise<{ statusCode: number; bytesWritten: number }> => {
+    console.log(`[iOS] Starting chunked download from offset: ${resumeOffset}`);
+    
+    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB per chunk for better speed
+    let currentOffset = resumeOffset;
+    let totalSize = totalFileSize || 0;
+    let statusCode = 200;
+    const tempChunkPath = `${targetPath}.chunk`;
+    
+    // Mark download as active
+    iosDownloadActiveRef.current[itemId] = true;
+    
+    // Clear file if starting fresh
+    if (resumeOffset === 0 && await RNFS.exists(targetPath)) {
+      await RNFS.unlink(targetPath);
+    }
+    
+    // Clean up any leftover temp chunk file
+    if (await RNFS.exists(tempChunkPath)) {
+      await RNFS.unlink(tempChunkPath);
+    }
+    
+    try {
+      // First, get total file size if not known
+      if (!totalSize) {
+        console.log('[iOS] Getting file size with HEAD request...');
+        try {
+          const headResponse = await fetch(url, { method: 'HEAD' });
+          const contentLength = headResponse.headers.get('Content-Length');
+          if (contentLength) {
+            totalSize = parseInt(contentLength, 10);
+          }
+        } catch (e) {
+          console.log('[iOS] HEAD request failed, will get size from first chunk');
+        }
+        console.log(`[iOS] Total file size: ${totalSize}`);
+      }
+      
+      // Download in chunks using RNFS.downloadFile (native, reliable)
+      while (currentOffset < totalSize || totalSize === 0) {
+        // Check for pause/cancel before each chunk
+        if (isPausedRef.current[itemId] || isCancelledRef.current[itemId]) {
+          console.log(`[iOS] Download interrupted at ${currentOffset} bytes`);
+          iosDownloadActiveRef.current[itemId] = false;
+          throw new Error('Download has been stopped');
+        }
+        
+        const rangeEnd = totalSize > 0 
+          ? Math.min(currentOffset + CHUNK_SIZE - 1, totalSize - 1)
+          : currentOffset + CHUNK_SIZE - 1;
+        
+        const chunkNum = Math.floor(currentOffset / CHUNK_SIZE) + 1;
+        const totalChunks = totalSize > 0 ? Math.ceil(totalSize / CHUNK_SIZE) : '?';
+        console.log(`[iOS] Downloading chunk ${chunkNum}/${totalChunks}: bytes ${currentOffset}-${rangeEnd}`);
+        
+        // Use RNFS.downloadFile to download this chunk (native, no base64 issues)
+        const downloadJob = RNFS.downloadFile({
+          fromUrl: url,
+          toFile: tempChunkPath,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Mobile; rv:1.0) Gecko/1.0 Firefox/1.0',
+            'Range': `bytes=${currentOffset}-${rangeEnd}`,
+          },
+          progressDivider: 10, // Less frequent updates for chunk downloads
+        });
+        
+        // Store job ID for potential cancellation
+        iosCurrentJobRef.current[itemId] = downloadJob.jobId;
+        
+        let result;
+        try {
+          result = await downloadJob.promise;
+        } catch (downloadError: any) {
+          delete iosCurrentJobRef.current[itemId];
+          // Check if cancelled/paused
+          if (isPausedRef.current[itemId] || isCancelledRef.current[itemId]) {
+            console.log(`[iOS] Chunk download stopped due to pause/cancel`);
+            // Clean up any partial temp file
+            if (await RNFS.exists(tempChunkPath)) {
+              await RNFS.unlink(tempChunkPath);
+            }
+            iosDownloadActiveRef.current[itemId] = false;
+            throw new Error('Download has been stopped');
+          }
+          throw downloadError;
+        }
+        delete iosCurrentJobRef.current[itemId];
+        
+        // Check if cancelled/paused after download completed
+        if (isPausedRef.current[itemId] || isCancelledRef.current[itemId]) {
+          console.log(`[iOS] Cancelled/paused after chunk download`);
+          if (await RNFS.exists(tempChunkPath)) {
+            await RNFS.unlink(tempChunkPath);
+          }
+          iosDownloadActiveRef.current[itemId] = false;
+          throw new Error('Download has been stopped');
+        }
+        
+        statusCode = result.statusCode;
+        
+        // Check for valid response
+        if (result.statusCode !== 206 && result.statusCode !== 200) {
+          throw new Error(`Server returned status code ${result.statusCode}`);
+        }
+        
+        // If server doesn't support Range and we're resuming, can't continue
+        if (result.statusCode === 200 && currentOffset > 0) {
+          console.log('[iOS] Server does not support Range requests, cannot resume');
+          throw new Error('Server does not support resumable downloads');
+        }
+        
+        // Check if temp chunk file exists before stat
+        if (!await RNFS.exists(tempChunkPath)) {
+          throw new Error('Chunk file was not created');
+        }
+        
+        // Get actual chunk size from downloaded file
+        const chunkStat = await RNFS.stat(tempChunkPath);
+        const chunkBytes = chunkStat.size;
+        
+        // If this is first chunk and we don't know total size, estimate it
+        if (totalSize === 0 && result.statusCode === 200) {
+          totalSize = chunkBytes;
+          console.log(`[iOS] Got full file in one request: ${totalSize} bytes`);
+        }
+        
+        // Check for pause/cancel before appending
+        if (isPausedRef.current[itemId] || isCancelledRef.current[itemId]) {
+          console.log(`[iOS] Download interrupted before append at ${currentOffset} bytes`);
+          if (await RNFS.exists(tempChunkPath)) {
+            await RNFS.unlink(tempChunkPath);
+          }
+          iosDownloadActiveRef.current[itemId] = false;
+          throw new Error('Download has been stopped');
+        }
+        
+        // Append chunk to main file (or move if first chunk)
+        if (currentOffset === 0) {
+          await RNFS.moveFile(tempChunkPath, targetPath);
+        } else {
+          // Read chunk and append to main file
+          const APPEND_CHUNK_SIZE = 256 * 1024; // 256KB append chunks
+          let bytesAppended = 0;
+          while (bytesAppended < chunkBytes) {
+            if (isPausedRef.current[itemId] || isCancelledRef.current[itemId]) {
+              // Clean up temp file if interrupted during append
+              if (await RNFS.exists(tempChunkPath)) {
+                await RNFS.unlink(tempChunkPath);
+              }
+              iosDownloadActiveRef.current[itemId] = false;
+              throw new Error('Download has been stopped');
+            }
+            const readLength = Math.min(APPEND_CHUNK_SIZE, chunkBytes - bytesAppended);
+            const chunkData = await RNFS.read(tempChunkPath, readLength, bytesAppended, 'base64');
+            await RNFS.appendFile(targetPath, chunkData, 'base64');
+            bytesAppended += readLength;
+          }
+          await RNFS.unlink(tempChunkPath);
+        }
+        
+        currentOffset += chunkBytes;
+        onProgress(currentOffset, totalSize);
+        
+        console.log(`[iOS] Chunk ${chunkNum} complete, total: ${currentOffset}/${totalSize} bytes (${Math.round(currentOffset/totalSize*100)}%)`);
+        
+        // If server returned 200 (full file), we're done
+        if (result.statusCode === 200) {
+          break;
+        }
+      }
+      
+      console.log(`[iOS] Download complete: ${currentOffset} bytes`);
+      iosDownloadActiveRef.current[itemId] = false;
+      return { statusCode, bytesWritten: currentOffset };
+      
+    } catch (error: any) {
+      iosDownloadActiveRef.current[itemId] = false;
+      // Clean up temp chunk file
+      if (await RNFS.exists(tempChunkPath)) {
+        await RNFS.unlink(tempChunkPath);
+      }
+      throw error;
+    }
+  };
+
   const handleDownload = async (item: DownloadItem, forceCellular = false, isResume = false) => {
     if (downloading && downloading !== item.id) {
       Alert.alert('Download in Progress', 'Please wait for the current download to finish or pause it first.');
@@ -375,17 +573,26 @@ export default function DownloadsScreen() {
       let isResumedDownload = false;
 
       if (isResume) {
+        console.log(`[${Platform.OS}] Resume requested for item:`, item.id);
+        
+        // iOS: Add small delay to ensure file system is stable
+        if (Platform.OS === 'ios') {
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        
         // 1. CONSOLIDATION: If a previous .tmp exists, append it to the main file FIRST
         // This ensures if we were paused during a resume, we don't lose that progress.
         if (await RNFS.exists(tempPath)) {
           console.log('Found existing .tmp file, consolidating before resume...');
           const CHUNK_SIZE = 1024 * 256;
           const stat = await RNFS.stat(tempPath);
+          console.log(`[${Platform.OS}] Temp file size:`, stat.size);
           let bytesRead = 0;
 
           // If the main file doesn't exist but .tmp does, move .tmp to main
           if (!(await RNFS.exists(downloadedFilePath))) {
             await RNFS.moveFile(tempPath, downloadedFilePath);
+            console.log(`[${Platform.OS}] Moved temp to main file`);
           } else {
             while (bytesRead < stat.size) {
               if (isCancelledRef.current[item.id] || isPausedRef.current[item.id]) break;
@@ -405,7 +612,10 @@ export default function DownloadsScreen() {
           const stat = await RNFS.stat(downloadedFilePath);
           resumeOffset = stat.size;
           isResumedDownload = resumeOffset > 0;
-          console.log(`Resuming from offset: ${resumeOffset} bytes`);
+          console.log(`[${Platform.OS}] Main file exists, size: ${stat.size} bytes`);
+          console.log(`[${Platform.OS}] Resuming from offset: ${resumeOffset} bytes`);
+        } else {
+          console.log(`[${Platform.OS}] No existing file found, starting fresh download`);
         }
       } else {
         // Fresh download, clear existing files
@@ -421,105 +631,149 @@ export default function DownloadsScreen() {
         )
       );
 
-      const headers: { [key: string]: string } = {
-        'User-Agent': 'Mozilla/5.0 (Mobile; rv:1.0) Gecko/1.0 Firefox/1.0',
-      };
-
-      if (resumeOffset > 0) {
-        headers['Range'] = `bytes=${resumeOffset}-`;
-      }
-
-      // Always download to .tmp when resuming to keep main file stable
-      // or to main file if it's a fresh start.
-      const targetPath = resumeOffset > 0 ? tempPath : downloadedFilePath;
-
-      const downloadJob = RNFS.downloadFile({
-        fromUrl: directUrl,
-        toFile: targetPath,
-        headers,
-        progress: (res) => {
+      // iOS: Use chunked download with fetch that writes directly to disk (supports true pause/resume)
+      // Android: Use RNFS.downloadFile which preserves partial files on stopDownload
+      if (Platform.OS === 'ios') {
+        console.log('[iOS] Using chunked download method');
+        
+        const onProgress = (bytesWritten: number, totalBytes: number) => {
           if (isPausedRef.current[item.id] || isCancelledRef.current[item.id]) return;
-
-          const currentTotalWritten = resumeOffset + res.bytesWritten;
           
-          // FIX: If we have item.fileSize, it's already the total. 
-          // res.contentLength is only the REMAINING size when Range is used.
-          let totalSize = item.fileSize;
-          if (!totalSize || totalSize <= 0) {
-             totalSize = res.contentLength + (resumeOffset > 0 ? resumeOffset : 0);
-          }
-
-          const progress = Math.min(
-            99,
-            Math.floor((currentTotalWritten / totalSize) * 100)
-          );
-
+          const progress = Math.min(99, Math.floor((bytesWritten / totalBytes) * 100));
+          
           setDownloads(prev =>
             prev.map(d =>
               d.id === item.id
                 ? {
                     ...d,
                     progress,
-                    downloadedBytes: currentTotalWritten,
-                    fileSize: totalSize,
+                    downloadedBytes: bytesWritten,
+                    fileSize: totalBytes,
                   }
                 : d
             )
           );
-        },
-
-        progressDivider: 1,
-      });
-
-      downloadResumableRef.current[item.id] = downloadJob;
-      setDownloads(prev => prev.map(d => d.id === item.id ? { ...d, jobId: downloadJob.jobId } : d));
-
-      // IMMEDIATE CHECK: If user paused/cancelled while we were initialized the job
-      if (isPausedRef.current[item.id]) {
-        console.log('User requested pause during initialization, stopping immediately.');
-        try { RNFS.stopDownload(downloadJob.jobId); } catch (e) { console.log(e); }
-      }
-      if (isCancelledRef.current[item.id]) {
-        console.log('User requested cancel during initialization, stopping immediately.');
-        try { RNFS.stopDownload(downloadJob.jobId); } catch (e) { console.log(e); }
-      }
-
-      const downloadResult = await downloadJob.promise;
-      
-      // CRITICAL: Clear native job ref immediately after it settles
-      delete downloadResumableRef.current[item.id];
-      
-      // Check for interruption early
-      if (isCancelledRef.current[item.id] || isPausedRef.current[item.id]) {
-        return;
-      }
-
-      if (downloadResult.statusCode >= 400 && downloadResult.statusCode !== 206) {
-        throw new Error(`Server returned status code ${downloadResult.statusCode}`);
-      }
-
-      // If we used a temp file for resume, append it and delete temp
-      if (resumeOffset > 0 && await RNFS.exists(targetPath)) {
-        console.log('Appending resumed chunk safely...');
-        const CHUNK_SIZE = 1024 * 256; // 256KB chunks
-        const stat = await RNFS.stat(targetPath);
-        let bytesRead = 0;
+        };
         
-        while (bytesRead < stat.size) {
-          // Check BEFORE every single bridge call
-          if (isCancelledRef.current[item.id] || isPausedRef.current[item.id]) break;
-
-          const length = Math.min(CHUNK_SIZE, stat.size - bytesRead);
-          const chunk = await RNFS.read(targetPath, length, bytesRead, 'base64');
-  
-          if (isCancelledRef.current[item.id] || isPausedRef.current[item.id]) break;
-          await RNFS.appendFile(downloadedFilePath, chunk, 'base64');
-  
-          bytesRead += length;
+        const result = await downloadWithChunksIOS(
+          item.id,
+          directUrl,
+          downloadedFilePath, // iOS writes directly to main file
+          resumeOffset,
+          item.fileSize,
+          onProgress
+        );
+        
+        // Check for interruption
+        if (isCancelledRef.current[item.id] || isPausedRef.current[item.id]) {
+          return;
         }
-        // Delete the temp file ONLY if we weren't interrupted
-        if (!isCancelledRef.current[item.id] && !isPausedRef.current[item.id]) {
-          await RNFS.unlink(targetPath);
+        
+        if (result.statusCode >= 400 && result.statusCode !== 206) {
+          throw new Error(`Server returned status code ${result.statusCode}`);
+        }
+      } else {
+        // Android: Use RNFS.downloadFile (preserves partial files)
+        const headers: { [key: string]: string } = {
+          'User-Agent': 'Mozilla/5.0 (Mobile; rv:1.0) Gecko/1.0 Firefox/1.0',
+        };
+
+        if (resumeOffset > 0) {
+          headers['Range'] = `bytes=${resumeOffset}-`;
+        }
+
+        // Always download to .tmp when resuming to keep main file stable
+        // or to main file if it's a fresh start.
+        const targetPath = resumeOffset > 0 ? tempPath : downloadedFilePath;
+
+        const downloadJob = RNFS.downloadFile({
+          fromUrl: directUrl,
+          toFile: targetPath,
+          headers,
+          progress: (res) => {
+            if (isPausedRef.current[item.id] || isCancelledRef.current[item.id]) return;
+
+            const currentTotalWritten = resumeOffset + res.bytesWritten;
+            
+            // FIX: If we have item.fileSize, it's already the total. 
+            // res.contentLength is only the REMAINING size when Range is used.
+            let totalSize = item.fileSize;
+            if (!totalSize || totalSize <= 0) {
+               totalSize = res.contentLength + (resumeOffset > 0 ? resumeOffset : 0);
+            }
+
+            const progress = Math.min(
+              99,
+              Math.floor((currentTotalWritten / totalSize) * 100)
+            );
+
+            setDownloads(prev =>
+              prev.map(d =>
+                d.id === item.id
+                  ? {
+                      ...d,
+                      progress,
+                      downloadedBytes: currentTotalWritten,
+                      fileSize: totalSize,
+                    }
+                  : d
+              )
+            );
+          },
+
+          progressDivider: 1,
+        });
+
+        downloadResumableRef.current[item.id] = downloadJob;
+        setDownloads(prev => prev.map(d => d.id === item.id ? { ...d, jobId: downloadJob.jobId } : d));
+
+        // IMMEDIATE CHECK: If user paused/cancelled while we were initialized the job
+        if (isPausedRef.current[item.id]) {
+          console.log('User requested pause during initialization, stopping immediately.');
+          try { RNFS.stopDownload(downloadJob.jobId); } catch (e) { console.log(e); }
+        }
+        if (isCancelledRef.current[item.id]) {
+          console.log('User requested cancel during initialization, stopping immediately.');
+          try { RNFS.stopDownload(downloadJob.jobId); } catch (e) { console.log(e); }
+        }
+
+        const downloadResult = await downloadJob.promise;
+        
+        // CRITICAL: Clear native job ref immediately after it settles
+        delete downloadResumableRef.current[item.id];
+        
+        // Check for interruption early
+        if (isCancelledRef.current[item.id] || isPausedRef.current[item.id]) {
+          return;
+        }
+
+        if (downloadResult.statusCode >= 400 && downloadResult.statusCode !== 206) {
+          throw new Error(`Server returned status code ${downloadResult.statusCode}`);
+        }
+
+        // If we used a temp file for resume, append it and delete temp
+        if (resumeOffset > 0 && await RNFS.exists(targetPath)) {
+          console.log('Appending resumed chunk safely...');
+          const CHUNK_SIZE = 1024 * 256; // 256KB chunks
+          const stat = await RNFS.stat(targetPath);
+          let bytesRead = 0;
+          
+          while (bytesRead < stat.size) {
+            // Check BEFORE every single bridge call
+            if (isCancelledRef.current[item.id] || isPausedRef.current[item.id]) break;
+
+            const length = Math.min(CHUNK_SIZE, stat.size - bytesRead);
+            const chunk = await RNFS.read(targetPath, length, bytesRead, 'base64');
+    
+            if (isCancelledRef.current[item.id] || isPausedRef.current[item.id]) break;
+            await RNFS.appendFile(downloadedFilePath, chunk, 'base64');
+    
+            bytesRead += length;
+          }
+          // Delete the temp file ONLY if we weren't interrupted
+          if (!isCancelledRef.current[item.id] && !isPausedRef.current[item.id]) {
+            await RNFS.unlink(targetPath);
+          }
         }
       }
       
@@ -575,8 +829,10 @@ export default function DownloadsScreen() {
           isResumedDownload: false
         } : d));
         
-        // Final cleanup of files if necessary
-        cleanUpFiles(item.id, item.downloadUrl);
+        // Final cleanup of files if necessary (don't await, let it run in background)
+        cleanUpFiles(item.id, item.downloadUrl).catch(e => 
+          console.log('[handleDownload] Cleanup error (safe to ignore):', e)
+        );
       } else if (wasUserPaused) {
         console.log('Download was paused by user (Graceful)');
         setDownloads(prev => prev.map(d => d.id === item.id ? { ...d, status: 'PAUSED', jobId: undefined } : d));
@@ -600,43 +856,107 @@ export default function DownloadsScreen() {
   };
 
   const cleanUpFiles = async (itemId: string, downloadUrl: string) => {
-    const downloadsDir = `${RNFS.CachesDirectoryPath}/downloads`;
-    const isZip = isZipFile(downloadUrl);
-    const fileName = `tour_${itemId}.${isZip ? 'zip' : 'file'}`;
-    const downloadedFilePath = `${downloadsDir}/${fileName}`;
-    if (await RNFS.exists(downloadedFilePath)) {
-      await RNFS.unlink(downloadedFilePath);
-    }
-    if (await RNFS.exists(`${downloadedFilePath}.tmp`)) {
-      await RNFS.unlink(`${downloadedFilePath}.tmp`);
-    }
-    const unzipDir = `${RNFS.CachesDirectoryPath}/unzipped_${itemId}`;
-    if (await RNFS.exists(unzipDir)) {
-      await RNFS.unlink(unzipDir);
+    try {
+      const downloadsDir = `${RNFS.CachesDirectoryPath}/downloads`;
+      const isZip = isZipFile(downloadUrl);
+      const fileName = `tour_${itemId}.${isZip ? 'zip' : 'file'}`;
+      const downloadedFilePath = `${downloadsDir}/${fileName}`;
+      
+      // Clean up main file
+      if (await RNFS.exists(downloadedFilePath)) {
+        await RNFS.unlink(downloadedFilePath);
+      }
+      // Clean up Android temp file
+      if (await RNFS.exists(`${downloadedFilePath}.tmp`)) {
+        await RNFS.unlink(`${downloadedFilePath}.tmp`);
+      }
+      // Clean up iOS chunk temp file
+      if (await RNFS.exists(`${downloadedFilePath}.chunk`)) {
+        await RNFS.unlink(`${downloadedFilePath}.chunk`);
+      }
+      // Clean up unzip directory
+      const unzipDir = `${RNFS.CachesDirectoryPath}/unzipped_${itemId}`;
+      if (await RNFS.exists(unzipDir)) {
+        await RNFS.unlink(unzipDir);
+      }
+    } catch (error) {
+      console.log('[cleanUpFiles] Error during cleanup (safe to ignore):', error);
     }
   };
 
-  const handlePauseDownload = useCallback((itemId: string) => {
+  const handlePauseDownload = useCallback(async (itemId: string) => {
     isPausedRef.current[itemId] = true;
-    const job = downloadResumableRef.current[itemId];
     const item = downloads.find(d => d.id === itemId);
     const isExtracting = item?.status === 'EXTRACTING';
     
-    if (job && !isExtracting) {
-      console.log('Requesting pause for:', itemId, 'Job ID:', job.jobId);
-      // Use a try-catch and check jobId existence
-      try {
-        if (job.jobId !== undefined && job.jobId !== null) {
-          RNFS.stopDownload(job.jobId);
-          console.log('Native stopDownload called for ID:', job.jobId);
+    if (isExtracting) {
+      console.log('Cannot pause during extraction for:', itemId);
+      setDownloads(prev => prev.map(d => d.id === itemId ? { ...d, status: 'PAUSED', jobId: undefined } : d));
+      return;
+    }
+    
+    console.log(`[${Platform.OS}] Requesting pause for:`, itemId);
+    
+    if (Platform.OS === 'ios') {
+      // iOS: Flag is already set, download loop will stop after current chunk
+      console.log('[iOS] Pause flag set, stopping current chunk download...');
+      
+      // Stop current chunk download if in progress
+      const currentJobId = iosCurrentJobRef.current[itemId];
+      if (currentJobId !== undefined) {
+        try {
+          RNFS.stopDownload(currentJobId);
+          console.log('[iOS] Stopped current chunk download, job ID:', currentJobId);
+        } catch (e) {
+          console.log('[iOS] Could not stop current chunk:', e);
         }
-      } catch (err) {
-        console.log('Native stopDownload failed or already stopped:', err);
+      }
+      
+      // Wait for download to stop (it checks flag between chunks)
+      let waitCount = 0;
+      while (iosDownloadActiveRef.current[itemId] && waitCount < 50) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        waitCount++;
+      }
+      
+      // Verify file size
+      const downloadsDir = `${RNFS.CachesDirectoryPath}/downloads`;
+      const isZip = item?.downloadUrl?.toLowerCase().includes('.zip') || false;
+      const fileName = `tour_${itemId}.${isZip ? 'zip' : 'file'}`;
+      const downloadedFilePath = `${downloadsDir}/${fileName}`;
+      
+      if (await RNFS.exists(downloadedFilePath)) {
+        const stat = await RNFS.stat(downloadedFilePath);
+        console.log('[iOS] File size after pause:', stat.size);
+        setDownloads(prev => prev.map(d => 
+          d.id === itemId ? { 
+            ...d, 
+            downloadedBytes: stat.size,
+            status: 'PAUSED',
+            jobId: undefined 
+          } : d
+        ));
+      } else {
+        console.log('[iOS] No file found after pause - likely no data was written yet');
+        setDownloads(prev => prev.map(d => d.id === itemId ? { ...d, status: 'PAUSED', jobId: undefined } : d));
       }
     } else {
-      console.log('No active job to pause or already extracting for:', itemId);
-      // If already extracting or no job, we just mark it as paused for state sync
-      setDownloads(prev => prev.map(d => d.id === itemId ? { ...d, status: 'PAUSED', jobId: undefined } : d));
+      // Android: Use RNFS.stopDownload
+      const job = downloadResumableRef.current[itemId];
+      if (job) {
+        console.log('[Android] Requesting pause, Job ID:', job.jobId);
+        try {
+          if (job.jobId !== undefined && job.jobId !== null) {
+            RNFS.stopDownload(job.jobId);
+            console.log('[Android] Native stopDownload called for ID:', job.jobId);
+          }
+        } catch (err) {
+          console.log('[Android] Native stopDownload failed or already stopped:', err);
+        }
+      } else {
+        console.log('[Android] No active job to pause for:', itemId);
+        setDownloads(prev => prev.map(d => d.id === itemId ? { ...d, status: 'PAUSED', jobId: undefined } : d));
+      }
     }
   }, [downloads]);
 
@@ -652,17 +972,41 @@ export default function DownloadsScreen() {
 
   const cancelDownload = async (itemId: string) => {
     isCancelledRef.current[itemId] = true;
-    const job = downloadResumableRef.current[itemId];
-    console.log('Requesting cancel for:', itemId, 'Job ID:', job?.jobId);
-
-    if (job) {
-      try {
-        if (job.jobId !== undefined && job.jobId !== null) {
-          RNFS.stopDownload(job.jobId);
-          console.log('Native stopDownload called during cancel for ID:', job.jobId);
+    console.log(`[${Platform.OS}] Requesting cancel for:`, itemId);
+    
+    if (Platform.OS === 'ios') {
+      // iOS: Flag is already set, stop current chunk download
+      console.log('[iOS] Cancel flag set, stopping current chunk download...');
+      
+      // Stop current chunk download if in progress
+      const currentJobId = iosCurrentJobRef.current[itemId];
+      if (currentJobId !== undefined) {
+        try {
+          RNFS.stopDownload(currentJobId);
+          console.log('[iOS] Stopped current chunk download, job ID:', currentJobId);
+        } catch (e) {
+          console.log('[iOS] Could not stop current chunk:', e);
         }
-      } catch (err) {
-        console.warn('Error calling stopDownload during cancel:', err);
+      }
+      
+      // Wait for download to stop
+      let waitCount = 0;
+      while (iosDownloadActiveRef.current[itemId] && waitCount < 50) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        waitCount++;
+      }
+    } else {
+      // Android: Use RNFS.stopDownload
+      const job = downloadResumableRef.current[itemId];
+      if (job) {
+        try {
+          if (job.jobId !== undefined && job.jobId !== null) {
+            RNFS.stopDownload(job.jobId);
+            console.log('[Android] Native stopDownload called during cancel for ID:', job.jobId);
+          }
+        } catch (err) {
+          console.warn('[Android] Error calling stopDownload during cancel:', err);
+        }
       }
     }
 
